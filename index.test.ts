@@ -96,6 +96,7 @@ describe("OGO router M1", () => {
 				virtualModel = definition;
 			},
 			registerTool() {},
+			registerCommand() {},
 			getAllTools: () => [],
 			on(event: string, handler: unknown) {
 				handlers.set(event, handler as (...args: unknown[]) => unknown);
