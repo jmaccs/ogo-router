@@ -21,14 +21,15 @@ describe("Go usage snapshots", () => {
 			[
 				{ provider: "opencode-go", model: "m1", cost: 0, timestamp: now, recordedAt: now + 1 },
 				{ provider: "opencode-go", model: "m2", cost: 0, timestamp: now, recordedAt: now - 1 },
-				{ provider: "openrouter", model: "m3", cost: 0, timestamp: now, recordedAt: now + 1 },
+				{ provider: "opencode-go", model: "m3", cost: 0, timestamp: now, recordedAt: now },
+				{ provider: "openrouter", model: "m4", cost: 0, timestamp: now, recordedAt: now + 1 },
 			],
 			"opencode-go",
 			now,
 		);
 
 		expect(meter.used).toEqual({ fiveHours: 50, week: 75, month: 10 });
-		expect(meter.pending).toEqual({ fiveHours: 1, week: 1, month: 1 });
+		expect(meter.pending).toEqual({ fiveHours: 2, week: 2, month: 2 });
 		expect(meter.pressure).toBeCloseTo(1.05);
 	});
 

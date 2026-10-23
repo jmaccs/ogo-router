@@ -4,6 +4,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+	refreshModelCatalog,
+	type ModelCatalogResult,
+	type ModelCatalogSnapshot,
+} from "./catalog.ts";
+import { registerDelegation } from "./delegation.ts";
+import {
 	computeSnapshotMeter,
 	parseGoUsageSnapshot,
 	usageWindows,
@@ -16,6 +22,7 @@ const root = dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.OGO_ROUTER_DATA_DIR ?? join(homedir(), ".pi", "agent");
 const ledgerPath = join(dataDir, "ogo-router-usage.jsonl");
 const snapshotPath = join(dataDir, "ogo-router-usage-snapshot.json");
+const modelCatalogPath = join(dataDir, "ogo-model-catalog.json");
 const refreshIntervalMs = 60_000;
 
 type QuotaWindow = UsageWindow;
@@ -29,12 +36,18 @@ type RouterState = {
 	budgetState: Pressure;
 	retryCounts: Record<string, number>;
 };
-type LedgerEntry = UsageLedgerRecord & { cost: number };
+type LedgerEntry = UsageLedgerRecord & { cost: number; role?: string };
 type Quota = Record<QuotaWindow, number | null>;
 type RouterConfig = {
 	virtualProvider: string;
 	virtualModel: string;
 	goProvider: string;
+	modelCatalog: {
+		url: string;
+		provider: string;
+		refreshIntervalMs: number;
+		timeoutMs: number;
+	};
 	tierModels: Record<string, string[]>;
 	escalationModels: string[];
 	modelQuotas: Record<string, Quota>;
@@ -60,6 +73,8 @@ let lastNotifiedUsageError: string | undefined;
 let lastFetchAttemptAt = 0;
 let usageStateLoaded = false;
 let usageRefresh: Promise<void> | undefined;
+let modelCatalogResult: ModelCatalogResult = { changedPrices: [] };
+let modelCatalogRefresh: Promise<void> | undefined;
 
 function parseJson<T>(text: string, source: string): T {
 	try {
@@ -82,6 +97,10 @@ if (
 	typeof routerConfig.virtualProvider !== "string" || !routerConfig.virtualProvider ||
 	typeof routerConfig.virtualModel !== "string" || !routerConfig.virtualModel ||
 	typeof routerConfig.goProvider !== "string" || !routerConfig.goProvider ||
+	!routerConfig.modelCatalog || typeof routerConfig.modelCatalog.url !== "string" ||
+	typeof routerConfig.modelCatalog.provider !== "string" ||
+	!Number.isFinite(routerConfig.modelCatalog.refreshIntervalMs) || routerConfig.modelCatalog.refreshIntervalMs < 60 * 60 * 1000 ||
+	!Number.isFinite(routerConfig.modelCatalog.timeoutMs) || routerConfig.modelCatalog.timeoutMs <= 0 ||
 	!routerConfig.tierModels || typeof routerConfig.tierModels !== "object" ||
 	!Array.isArray(routerConfig.escalationModels) ||
 	!routerConfig.modelQuotas || typeof routerConfig.modelQuotas !== "object"
@@ -143,6 +162,36 @@ function parseModelKey(key: string): ModelRef {
 	return { provider: key.slice(0, separator), id: key.slice(separator + 1) };
 }
 
+async function refreshModelData(): Promise<void> {
+	if (modelCatalogRefresh) return modelCatalogRefresh;
+	modelCatalogRefresh = (async () => {
+		modelCatalogResult = await refreshModelCatalog({
+			...routerConfig.modelCatalog,
+			cachePath: modelCatalogPath,
+		});
+		if (modelCatalogResult.error) {
+			console.warn(`[ogo-router] ${modelCatalogResult.error}; using cached catalog or configured model order.`);
+		}
+		if (modelCatalogResult.changedPrices.length) {
+			const changes = modelCatalogResult.priceChanges?.map(({ model, previous, current }) =>
+				`${model} input ${previous?.input ?? "n/a"}->${current?.input ?? "n/a"}, ` +
+				`output ${previous?.output ?? "n/a"}->${current?.output ?? "n/a"}`,
+			);
+			console.info(
+				`[ogo-router] models.dev pricing changed for ${modelCatalogResult.changedPrices.length} ` +
+				`${routerConfig.modelCatalog.provider} models: ${changes?.join("; ") ?? modelCatalogResult.changedPrices.join(", ")}`,
+			);
+		}
+	})().finally(() => {
+		modelCatalogRefresh = undefined;
+	});
+	await modelCatalogRefresh;
+}
+
+function modelCatalogSnapshot(): ModelCatalogSnapshot | undefined {
+	return modelCatalogResult.snapshot;
+}
+
 function tierOf(key: string): Tier | undefined {
 	for (const [tierText, models] of Object.entries(routerConfig.tierModels)) {
 		if (!models.includes(key)) continue;
@@ -188,17 +237,20 @@ function parseLedgerEntry(value: unknown, line: number): LedgerEntry {
 		!("model" in value) || typeof value.model !== "string" ||
 		!("cost" in value) || typeof value.cost !== "number" || !Number.isFinite(value.cost) ||
 		!("timestamp" in value) || typeof value.timestamp !== "number" || !Number.isFinite(value.timestamp) ||
-		("recordedAt" in value && (typeof value.recordedAt !== "number" || !Number.isFinite(value.recordedAt)))
+		("recordedAt" in value && (typeof value.recordedAt !== "number" || !Number.isFinite(value.recordedAt))) ||
+		("role" in value && typeof value.role !== "string")
 	) {
 		throw new Error(`Invalid usage ledger entry on line ${line} (${ledgerPath})`);
 	}
 	const recordedAt = "recordedAt" in value ? value.recordedAt : undefined;
+	const role = "role" in value && typeof value.role === "string" ? value.role : undefined;
 	return {
 		provider: value.provider,
 		model: value.model,
 		cost: value.cost,
 		timestamp: value.timestamp,
 		recordedAt: typeof recordedAt === "number" ? recordedAt : undefined,
+		role,
 	};
 }
 
@@ -464,6 +516,20 @@ function renderBudget(meter: Meter, pressure: Pressure, currentModel?: string): 
 			? `Local estimate; Pi Go requests: 5h ${meter.pending.fiveHours}, week ${meter.pending.week}, month ${meter.pending.month}`
 			: `Pi since sync: 5h ${meter.pending.fiveHours}, week ${meter.pending.week}, month ${meter.pending.month} requests`,
 	);
+	if (modelCatalogResult.snapshot) {
+		const ageMinutes = Math.max(0, Math.floor((Date.now() - modelCatalogResult.snapshot.fetchedAt) / 60_000));
+		const changeNote = modelCatalogResult.changedPrices.length
+			? ` | price changes: ${modelCatalogResult.changedPrices.slice(0, 3).join(", ")}` +
+				(modelCatalogResult.changedPrices.length > 3 ? ", ..." : "")
+			: "";
+		lines.push(
+			`models.dev ${modelCatalogResult.snapshot.provider}: ${Object.keys(modelCatalogResult.snapshot.models).length} models, ` +
+			`checked ${ageMinutes}m ago${changeNote}`,
+		);
+	} else {
+		lines.push(modelCatalogResult.error ?? "models.dev catalog unavailable; using configured model order");
+	}
+	if (modelCatalogResult.error) lines.push(`Catalog refresh issue: ${modelCatalogResult.error}`);
 	if (lastUsageError) lines.push(`Last Go sync issue: ${lastUsageError}`);
 	return lines;
 }
@@ -492,6 +558,37 @@ async function updateBudgetUI(ctx: ExtensionContext, state?: Pressure) {
 		console.warn(`[ogo-router] Usage refresh unavailable: ${lastUsageError}; using ${meter.source} budget data.`);
 	}
 	lastNotifiedUsageError = lastUsageError;
+}
+
+async function recordDelegateUsage(messages: unknown[], role: string): Promise<void> {
+	await mkdir(dataDir, { recursive: true });
+	const records: LedgerEntry[] = [];
+	for (const message of messages) {
+		if (
+			typeof message !== "object" || message === null ||
+			!("role" in message) || message.role !== "assistant" ||
+			!("provider" in message) || typeof message.provider !== "string" ||
+			!("model" in message) || typeof message.model !== "string" ||
+			!("timestamp" in message) || typeof message.timestamp !== "number" || !Number.isFinite(message.timestamp) ||
+			!("usage" in message) || typeof message.usage !== "object" || message.usage === null ||
+			!("cost" in message.usage) || typeof message.usage.cost !== "object" ||
+			message.usage.cost === null || !("total" in message.usage.cost) ||
+			typeof message.usage.cost.total !== "number" || !Number.isFinite(message.usage.cost.total)
+		) {
+			continue;
+		}
+		records.push({
+			provider: message.provider,
+			model: message.model,
+			cost: message.usage.cost.total,
+			timestamp: message.timestamp,
+			recordedAt: Date.now(),
+			role,
+		});
+	}
+	if (records.length) {
+		await appendFile(ledgerPath, `${records.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+	}
 }
 
 export default function (pi: ExtensionAPI) {
@@ -593,7 +690,27 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	registerDelegation(
+		pi,
+		{
+			dataDir,
+			async getBudgetCap(ctx) {
+				await refreshModelData();
+				await loadUsageState();
+				await refreshUsage();
+				const meter = computeMeter(await readLedger());
+				const state = pressureState(meter, activePressure);
+				activePressure = state;
+				return tierCap(state, ctx.thinkingLevel ?? "medium");
+			},
+			getModelCatalog: modelCatalogSnapshot,
+			recordUsage: recordDelegateUsage,
+		},
+		routerConfig.tierModels,
+	);
+
 	pi.on("session_start", async (_event, ctx) => {
+		await refreshModelData();
 		await refreshUsage(true);
 		await updateBudgetUI(ctx);
 	});

@@ -15,6 +15,10 @@ select `ogo/auto`.
   `classifyCategory()` in `index.ts` if your prompts use different vocabulary.
 - Category primaries and fallbacks are in `ogo.json`; tier assignments,
   quota estimates, and optional OpenRouter escalation are in `router.json`.
+- Delegation considers only models explicitly listed for a role's configured
+  tiers. Within each tier it prefers available tool-capable OpenCode Go models
+  with lower catalog input-plus-output prices; tier order and budget caps are
+  unchanged.
 - `direct` requests (such as compaction) use tier 0. Tool continuations stay
   sticky. A transient retry repeats the same model once; later retries move
   through the category fallback list.
@@ -55,6 +59,48 @@ routing at tier 1; orange caps at tier 2. Local per-model request caps from
 `router.json` remain an extra fallback guard for individual models.
 
 For isolated tests, `OGO_ROUTER_DATA_DIR` overrides the default data directory.
+
+## Model catalog and pricing
+
+`router.json` configures the models.dev catalog endpoint, provider, refresh
+interval, and timeout. The extension checks the provider catalog at most once
+per 24 hours, with a 90-second request timeout, and caches parsed OpenCode Go
+metadata in `~/.pi/agent/ogo-model-catalog.json`. Attempt timestamps (including
+failures) are persisted separately to avoid repeated slow requests. Failed
+refreshes retain the previous cache and leave the configured model order in
+place when no catalog is available.
+
+Fresh catalog prices rank candidates only within their configured delegation
+tier. The input and output values are a relative selection score, not a Go
+quota conversion or a prediction of an individual request's cost. Tool
+capability metadata prevents selecting models explicitly marked as unable to
+call tools. Pricing changes are logged by model ID and shown in the budget
+widget. New models are not automatically added to tiers: `router.json` remains
+the explicit allowlist and budget boundary.
+
+## Delegation
+
+The `delegate` tool launches isolated `pi --mode json -p --no-session`
+subprocesses. Each invocation receives only its bounded task brief, acceptance
+criteria, role instructions, and explicitly allowlisted skill content; it does
+not inherit the conductor's conversation. The conductor remains responsible for
+choosing a role, integrating results, and accepting edits.
+
+Role profiles and their output contracts live in [`agents/`](./agents/). Their
+`tier` and `fallback_tiers` are clamped to the current budget cap and available
+authenticated models in `router.json`. Retries move through at most three
+candidate models and temporarily cool down failed models. Role tool lists are
+intersected with tools active for the current session; recursive `delegate` and
+OGO budget tools are excluded. Skills are loaded only from each role's
+`skills:` allowlist.
+
+Parallel mode accepts up to four independent tasks and is restricted to roles
+marked `parallel: true` (currently scout). Results above 32 KiB are saved under
+`~/.pi/agent/delegate-results/` (or the configured data directory) and the tool
+returns a bounded excerpt and file path. Delegated assistant usage is appended
+to the usage ledger with its role, provider, model, cost, and timestamps; the
+tool result also reports aggregated token and cost usage, including failed
+attempts that produced usage data.
 
 ## Development
 

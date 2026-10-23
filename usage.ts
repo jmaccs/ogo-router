@@ -104,7 +104,7 @@ export function computeSnapshotMeter(
 		pending[window] = ledger.filter((entry) => {
 			const recordedAt = entry.recordedAt ?? entry.timestamp;
 			return entry.provider === goProvider &&
-				recordedAt > snapshot.fetchedAt &&
+				recordedAt >= snapshot.fetchedAt &&
 				entry.timestamp >= startAt &&
 				entry.timestamp <= now;
 		}).length;

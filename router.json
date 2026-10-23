@@ -2,6 +2,12 @@
   "virtualProvider": "ogo",
   "virtualModel": "auto",
   "goProvider": "opencode-go",
+  "modelCatalog": {
+    "url": "https://models.dev/api.json",
+    "provider": "opencode-go",
+    "refreshIntervalMs": 86400000,
+    "timeoutMs": 90000
+  },
   "tierModels": {
     "0": [
       "opencode-go/glm-5.3-flash",

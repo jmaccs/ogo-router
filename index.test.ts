@@ -67,7 +67,17 @@ describe("OGO router M1", () => {
 			const separator = ref.indexOf("/");
 			return { provider: ref.slice(0, separator), id: ref.slice(separator + 1) };
 		});
-		globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+		globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+			if (String(input).includes("models.dev")) {
+				return Response.json({
+					"opencode-go": {
+						models: {
+							"glm-5.3-flash": { cost: { input: 0.15, output: 0.5 }, tool_call: true },
+							"mimo-v2.5": { cost: { input: 0.14, output: 0.28 }, tool_call: true },
+						},
+					},
+				});
+			}
 			fetchAuthorization = new Headers(init?.headers).get("Authorization");
 			const now = Date.now();
 			const payload = {
@@ -85,6 +95,8 @@ describe("OGO router M1", () => {
 			registerVirtualModel(definition: ExtensionVirtualModel<unknown>) {
 				virtualModel = definition;
 			},
+			registerTool() {},
+			getAllTools: () => [],
 			on(event: string, handler: unknown) {
 				handlers.set(event, handler as (...args: unknown[]) => unknown);
 				return () => {};

@@ -33,14 +33,35 @@ Virtual model `ogo/auto` with a visible budget. No subagents yet.
 
 ## M2. Delegation
 
-Isolated subagents for scouting, chores, and execution.
+Delegate only bounded work that benefits from isolation, parallelism, or a
+different tool/model profile. The conductor remains the user-facing owner: it
+chooses a role, gives that role a task brief and acceptance criteria, integrates
+the result, and owns final edits and decisions. Subagents do not inherit the
+conversation; pass only the relevant dossier, files, constraints, and expected
+output.
 
-- [ ] **Adapt the stock subagent example.** Install `index.ts`, `agents.ts`, and the agents directory.
-- [ ] **Define roles.** scout (T0, read-only), mechanic (T0), worker (T1) as markdown with frontmatter.
-- [ ] **Build the delegate wrapper.** Fallback chain across sibling models plus a circuit breaker.
-- [ ] **Cap and spill outputs.** Long results go to a file, and the tool returns the path.
-- [ ] **Record subagent usage.** Feed it into the ledger and the tool result `usage` field.
-- [ ] **Preload skills into briefs.** Add a `skills:` allowlist per role.
+- [x] **Adapt the stock subagent example.** Implement an isolated Pi CLI subprocess wrapper using JSON-mode message and usage capture, plus the role directory.
+- [x] **Define role profiles.** Each profile declares its tier preference, allowed tools, job, output contract, and whether it may edit or delegate further.
+
+| Role | Tier | Tools | Job |
+|---|---|---|---|
+| **conductor** (main thread) | T1 | all | Talks to you, executes the plan, delegates |
+| **scout** | T0 | read-only | Recon, returns compressed context  |
+| **mechanic** | T0 | bash, edit | Formatting, renames, running tests, log triage, commit messages |
+| **planner** | T3 (or T2 when budget is tight) | read-only | Produces `PLAN.md` with ordered steps, dependencies, risks, and acceptance checks |
+| **worker** | T1 | all | Executes one plan step in isolation |
+| **reviewer** | T2/T3 | read-only | Reviews the diff against the plan; runs only on triggers |
+| **debugger** | T3 | read-only plus bash | Gets a failure dossier, returns a diagnosis and a fix strategy, not edits |
+| **summarizer** | T0 | none | Compaction, branch summaries, memory distillation |
+
+- [x] **Route delegation by role, not just tier.** Use scout for unfamiliar areas or evidence gathering; planner for multi-step or cross-cutting work; worker for one accepted plan step; mechanic for bounded mechanical chores; reviewer for triggered diff review; debugger after the stuck signals in M3; summarizer only for compaction or durable-memory distillation. The conductor handles routine small changes directly.
+- [x] **Keep role permissions narrow.** Scout, planner, reviewer, debugger, and summarizer are non-editing. Mechanic may edit only when the brief names the mechanical change and scope. Worker receives the tools needed for its single assigned step. No role may spawn another delegate by default; only the conductor orchestrates delegation.
+- [x] **Define role-specific output contracts.** Scout returns findings with file/line evidence and unknowns; planner returns steps and acceptance checks; worker returns changed paths, validation, and blockers; mechanic summarizes exact mechanical edits and commands; reviewer returns only actionable findings with evidence; debugger returns a diagnosis and ranked fix strategy without editing; summarizer returns compact durable context and open items.
+- [x] **Use explicit delegation patterns.** Recon precedes planning when repository context is unknown; independent scout tasks may run in parallel; workers execute isolated plan steps; reviewer runs after changes only on M4 triggers. The conductor checks results and tests before accepting them.
+- [x] **Build the delegate wrapper.** Fallback chain across sibling models plus a circuit breaker.
+- [x] **Cap and spill outputs.** Long results go to a file, and the tool returns the path.
+- [x] **Record subagent usage.** Feed usage into the budget ledger and tool result `usage` field, tagging the role and provider so budget gates can account for delegated work.
+- [x] **Preload skills into briefs.** Add a `skills:` allowlist per role; scout and summarizer default to none, while other roles receive only skills needed for their assigned task.
 
 ## M3. Escalation and fallback
 
@@ -48,7 +69,7 @@ Flagship only when needed, and only within budget.
 
 - [ ] **Add `request_escalation` tool.** The cheap model states what it tried and why it is stuck.
 - [ ] **Build a stuck detector at `turn_end`.** Same error twice, three failed tool results, or tests failing after "done".
-- [ ] **Add planner and debugger roles.** T3 or T2 by budget, read-only, with a dossier builder for their briefs.
+- [ ] **Wire planner and debugger triggers.** Reuse their M2 role profiles; invoke the planner for complex plans and debugger only with a bounded failure dossier.
 - [ ] **Gate in `tool_call`.** Block or downgrade T3 delegation when the budget is red.
 - [ ] **Add phase transitions in `route()`.** First edit, failure streak, and escalation flag, all inside the cap.
 - [ ] **Implement the retry ladder.** Transient, then rate limit, then capability, then overflow handling.
@@ -70,7 +91,7 @@ Make it trustworthy.
 - [ ] **Tune thresholds from observed usage.** After about a week, compare snapshots, optimistic local deltas, and actual routing outcomes.
 - [ ] **Compare against a single-model baseline.** Cost and success on a few repeat tasks.
 
-## Core design
+## Delegation strategy
 
 The upstream example has the strong model drive planning and make the first edit. I’d invert that. Flagship models are consultants, not drivers. The main loop sits on a mid-tier model, and flagship calls are short, isolated subagent runs with a curated brief and a compact artifact as output. A flagship call with 5k tokens of context costs far less than a flagship carrying a 100k transcript. It also sidesteps the prompt-cache penalty of switching the main thread’s model.
 
@@ -79,32 +100,24 @@ Two mechanisms, with a clear split:
 Mechanism Use for
 Virtual model route() Switching the main thread between tiers (sequential work in one context)
 delegate tool, with subprocess agents Isolated, parallel, read-heavy, or advice-only work
-Roles
 
-Tiers are placeholders you fill from Go’s catalog (and any non-Go keys): T0 flash, T1 mid, T2 strong, T3 flagship.
-
-Role Tier Tools Job
-conductor (main thread) T1 all Talks to you, executes the plan, delegates
-scout T0 read-only Recon, returns compressed context (the stock example)
-mechanic T0 bash, edit Formatting, renames, running tests, log triage, commit messages
-planner T3 (or T2 when budget is tight) read-only Writes PLAN.md with steps and acceptance checks
-worker T1 all Executes one plan step in isolation
-reviewer T2/T3 read-only Reviews the diff against the plan; runs only on triggers
-debugger T3 read-only plus bash Gets a failure dossier, returns a diagnosis and a fix strategy, not edits
-summarizer T0 none Compaction, branch summaries, memory distillation
+The role table and output contracts in M2 are the single source of truth.
+Tiers remain config-driven placeholders until mapped from the Go catalog:
+T0 flash, T1 mid, T2 strong, and T3 flagship.
 
 ### Where the delegation decision lives
 
-Hook Decision
-input Explicit overrides only (/deep, /quick, @scout). No model call.
-before_agent_start Inject the role prompt, a one-line budget note, and the tool set for the tier. Check event.messageType to skip custom-triggered runs.
-route() with reason user The main decision. Classify the task (Jev or heuristics) into a starting tier and phase. This is the only place classification latency is paid.
-route() with reason continuation Sticky (preserves the cache). It changes only on observable events: the first edit, a failure streak, or an escalation request.
-route() with reason retry The fallback ladder (below).
-route() with reason direct Compaction and summaries always go to T0.
-tool_call Budget gate: block or downgrade delegate calls to T3 when the budget is red.
-turn_end Update the stuck detector and write the ledger.
-agent_before_settle Review gate. If the diff is large or touches risky paths, run the reviewer once and return continue: true with its verdict. Guard it with a flag in state, because an unconditional continuation loops.
+| Hook | Delegation responsibility |
+|---|---|
+| `input` | Honor explicit role overrides such as `@scout`; do not make a classifier call just to select a role. |
+| `before_agent_start` | Add the selected role's brief, budget note, and tool restrictions to delegated subprocesses; skip role injection for unrelated custom-triggered runs. |
+| `route()` with reason `user` | Choose the conductor's starting tier and phase; delegation role selection remains a separate orchestration decision. |
+| `route()` with reason `continuation` | Keep the conductor sticky; change tier only on observable transition signals. |
+| `route()` with reason `retry` | Apply fallback and cooldown behavior for the active role without widening its permissions. |
+| `route()` with reason `direct` | Route compaction/summarization work to T0. |
+| `tool_call` | Enforce role permissions, output limits, concurrency limits, and budget caps before launching delegates. |
+| `turn_end` | Update failure/stuck signals and usage accounting used to decide whether to invoke debugger or escalate. |
+| `agent_before_settle` | Run the reviewer only for M4 triggers; guard continuation so the review gate runs once. |
 
 Cheap signals for escalation:
 
@@ -113,7 +126,10 @@ Tests still failing after the worker reports “done”.
 An edit touching more than N files or sensitive paths.
 A model-callable request_escalation tool, where the cheap model states what it tried and why it’s stuck. The budget gate then decides whether it gets T2 or T3.
 
-The thinkingLevels of the virtual model (the docs say meaning is up to the router) work well as a frugal ↔ quality dial you set in /model. For example, low caps the tier at T1 and high allows T3 escalations.
+The virtual model's thinking level is the conductor's frugal ↔ quality dial.
+It does not override role permissions or budget caps: a high level may permit a
+T3 consultant role when budget allows, but cannot turn a read-only role into an
+editor or bypass the delegate gate.
 
 Sketch of the router:
 
