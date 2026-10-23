@@ -1,0 +1,71 @@
+{
+  "categories": {
+    "architect": {
+      "model": "opencode-go/glm-5.2",
+      "fallback_models": [
+        "opencode-go/glm-5.3",
+        "opencode-go/grok-4.6"
+      ]
+    },
+    "deep": {
+      "model": "opencode-go/minimax-m3",
+      "fallback_models": [
+        "opencode-go/qwen3.8-max",
+        "opencode-go/glm-5.3"
+      ]
+    },
+    "quick": {
+      "model": "opencode-go/mimo-v2.5",
+      "fallback_models": [
+        "opencode-go/longcat-2.0",
+        "opencode-go/glm-5.3-flash",
+        "opencode-go/deepseek-v4-flash"
+      ]
+    },
+    "unspecified-low": {
+      "model": "opencode-go/glm-5.3-flash",
+      "fallback_models": [
+        "opencode-go/qwen3.8-flash",
+        "opencode-go/mimo-v2.5"
+      ]
+    },
+    "unspecified-high": {
+      "model": "opencode-go/kimi-k2.7-code",
+      "fallback_models": [
+        "opencode-go/glm-5.2",
+        "opencode-go/minimax-m3",
+        "opencode-go/glm-5.3"
+      ]
+    },
+    "writing": {
+      "model": "opencode-go/qwen3.8-flash",
+      "fallback_models": [
+        "opencode-go/glm-5.3-flash",
+        "opencode-go/qwen3.7-plus"
+      ]
+    },
+    "visual-engineering": {
+      "model": "opencode-go/grok-4.6",
+      "fallback_models": [
+        "opencode-go/kimi-k3",
+        "opencode-go/glm-5.3",
+        "opencode-go/qwen3.8-flash"
+      ]
+    },
+    "ultrabrain": {
+      "model": "opencode-go/grok-4.6",
+      "fallback_models": [
+        "opencode-go/qwen3.8-max",
+        "opencode-go/glm-5.3",
+        "opencode-go/kimi-k3"
+      ]
+    },
+    "artistry": {
+      "model": "opencode-go/glm-5.2",
+      "fallback_models": [
+        "opencode-go/glm-5.3-flash",
+        "opencode-go/qwen3.8-flash"
+      ]
+      }
+    }
+}
