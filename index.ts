@@ -1,5 +1,4 @@
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
@@ -26,17 +25,23 @@ import {
   type UsageWindow,
 } from "./usage.ts";
 
-import { openSidebarPane, closeSidebarPane } from "./tmux.ts";
+import {
+  closePaneLater,
+  closeSidebarPane,
+  inTmux,
+  openDelegatePane,
+  openSidebarPane,
+} from "./tmux.ts";
+import { getDataDir, getStateFile } from "./state.ts";
 
 const root = dirname(fileURLToPath(import.meta.url));
-const dataDir =
-  process.env.OGO_ROUTER_DATA_DIR ?? join(homedir(), ".pi", "agent");
+const dataDir = getDataDir();
 const ledgerPath = join(dataDir, "ogo-router-usage.jsonl");
 const snapshotPath = join(dataDir, "ogo-router-usage-snapshot.json");
 const modelCatalogPath = join(dataDir, "ogo-model-catalog.json");
 const refreshIntervalMs = 60_000;
 
-export const stateFile = join(dataDir, `ogo-dashboard-${process.pid}.json`);
+export const stateFile = getStateFile(dataDir);
 
 type QuotaWindow = UsageWindow;
 type Tier = 0 | 1 | 2 | 3;
@@ -613,43 +618,15 @@ function fallbackCandidates(maxTier: Tier): string[] {
     .flatMap(([, models]) => models);
 }
 
-function bar(used: number, limit: number, width = 12): string {
-  if (!limit) return `[${"=".repeat(width)}] unlimited`;
-  const ratio = Math.min(used / limit, 1);
-  const filled = Math.round(ratio * width);
-  return `[${"#".repeat(filled)}${".".repeat(width - filled)}] ${Math.round(ratio * 100)}%`;
-}
-
-function renderBudget(
-  meter: Meter,
-  pressure: Pressure,
-  currentModel?: string,
-): string[] {
-  const tier = currentModel ? tierOf(currentModel) : undefined;
-  const age =
-    meter.fetchedAt === undefined
-      ? ""
-      : ` (${Math.max(0, Math.floor((Date.now() - meter.fetchedAt) / 60_000))}m old)`;
-  const source =
-    meter.source === "live"
-      ? `Go usage live${age}`
-      : meter.source === "stale"
-        ? `Go usage stale${age}`
-        : "local estimate";
+function renderBudgetStatus(meter: Meter): string[] {
   const lines = [
-    `OGO budget: ${pressure}${tier !== undefined ? ` | T${tier}` : ""}${currentModel ? ` | ${currentModel}` : ""}`,
-    `5h ${bar(meter.used.fiveHours, meter.limit.fiveHours)}  week ${bar(meter.used.week, meter.limit.week)}`,
-    `month ${bar(meter.used.month, meter.limit.month)}`,
-    `${source} | pace 5h ${meter.pace.fiveHours.toFixed(1)}x | week ${meter.pace.week.toFixed(1)}x | month ${meter.pace.month.toFixed(1)}x`,
     meter.windowStatus
       ? `API status 5h ${meter.windowStatus.fiveHours} | week ${meter.windowStatus.week} | month ${meter.windowStatus.month}`
       : "API status unavailable",
-  ];
-  lines.push(
     meter.source === "estimate"
       ? `Local estimate; Pi Go requests: 5h ${meter.pending.fiveHours}, week ${meter.pending.week}, month ${meter.pending.month}`
       : `Pi since sync: 5h ${meter.pending.fiveHours}, week ${meter.pending.week}, month ${meter.pending.month} requests`,
-  );
+  ];
   if (modelCatalogResult.snapshot) {
     const ageMinutes = Math.max(
       0,
@@ -670,12 +647,12 @@ function renderBudget(
     );
   }
   if (modelCatalogResult.error)
-    lines.push(`Catalog refresh issue: ${modelCatalogResult.error}`);
-  if (lastUsageError) lines.push(`Last Go sync issue: ${lastUsageError}`);
+    lines.push(`models.dev refresh issue: ${modelCatalogResult.error}`);
+  if (lastUsageError) lines.push(`Go sync issue: ${lastUsageError}`);
   return lines;
 }
 
-async function updateBudgetUI(ctx: ExtensionContext, state?: Pressure) {
+async function updateBudgetUI(state?: Pressure) {
   await loadUsageState();
   const entries = await readLedger();
   const meter = computeMeter(entries);
@@ -702,49 +679,20 @@ async function updateBudgetUI(ctx: ExtensionContext, state?: Pressure) {
           : meter.source === "stale"
             ? "Go usage stale"
             : "local estimate",
+      status: renderBudgetStatus(meter),
       notes: [
         lastUsageError && `⚠ ${lastUsageError}`,
         modelCatalogResult.error && `⚠ catalog: ${modelCatalogResult.error}`,
       ].filter((n): n is string => Boolean(n)),
     },
   });
-  ctx.ui.setStatus(
-    "ogo-budget",
-    `5h ${Math.round((meter.used.fiveHours / Math.max(meter.limit.fiveHours, 1)) * 100)}% | ` +
-      `wk ${Math.round((meter.used.week / Math.max(meter.limit.week, 1)) * 100)}% | ` +
-      `mo ${Math.round((meter.used.month / Math.max(meter.limit.month, 1)) * 100)}% | ${pressure} | ` +
-      (meter.source === "live"
-        ? "Go live"
-        : meter.source === "stale"
-          ? "Go stale"
-          : "local estimate"),
-  );
-  ctx.ui.setWidget(
-    "ogo-budget",
-    renderBudget(meter, pressure, currentRoutedModel),
-    { placement: "aboveEditor" },
-  );
-  if (pressure === "red" && lastNotifiedPressure !== "red" && ctx.hasUI) {
-    ctx.ui.notify(
-      `OGO ${meter.source} budget is red; routing is capped at tier 1.`,
-      "warning",
+  if (pressure === "red" && lastNotifiedPressure !== "red") {
+    console.warn(
+      `[ogo-router] ${meter.source} budget is red; routing is capped at tier 1.`,
     );
   }
   lastNotifiedPressure = pressure;
-  if (
-    lastUsageError &&
-    ctx.hasUI &&
-    lastNotifiedUsageError !== lastUsageError
-  ) {
-    ctx.ui.notify(
-      `OGO usage refresh unavailable: ${lastUsageError}. Using ${meter.source} budget data.`,
-      "warning",
-    );
-  } else if (
-    lastUsageError &&
-    !ctx.hasUI &&
-    lastNotifiedUsageError !== lastUsageError
-  ) {
+  if (lastUsageError && lastNotifiedUsageError !== lastUsageError) {
     console.warn(
       `[ogo-router] Usage refresh unavailable: ${lastUsageError}; using ${meter.source} budget data.`,
     );
@@ -929,6 +877,9 @@ export default function (pi: ExtensionAPI) {
       },
       getModelCatalog: modelCatalogSnapshot,
       recordUsage: recordDelegateUsage,
+      panes: inTmux()
+        ? { open: openDelegatePane, closeLater: closePaneLater }
+        : undefined,
     },
     routerConfig.tierModels,
   );
@@ -938,7 +889,7 @@ export default function (pi: ExtensionAPI) {
     if (!ok) openOverlaySidebar(ctx);
     await refreshModelData();
     await refreshUsage(true);
-    await updateBudgetUI(ctx);
+    await updateBudgetUI();
   });
   pi.on("session_shutdown", async () => {
     await closeSidebarPane();
@@ -952,12 +903,12 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-  pi.on("agent_settled", async (_event, ctx) => {
+  pi.on("agent_settled", async () => {
     await refreshUsage();
-    await updateBudgetUI(ctx);
+    await updateBudgetUI();
   });
 
-  pi.on("message_end", async (event, ctx) => {
+  pi.on("message_end", async (event) => {
     if (event.message.role !== "assistant") return;
     const { provider, model, usage, timestamp } = event.message;
     const messageText =
@@ -990,6 +941,6 @@ export default function (pi: ExtensionAPI) {
       recordedAt: Date.now(),
     };
     await appendFile(ledgerPath, `${JSON.stringify(entry)}\n`, "utf8");
-    await updateBudgetUI(ctx);
+    await updateBudgetUI();
   });
 }

@@ -10,9 +10,8 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import { writeFile, rename } from "node:fs/promises";
-import { join } from "node:path";
 
-import { stateFile } from ".";
+import { getStateFile } from "./state.ts";
 
 export type Pressure = "green" | "yellow" | "orange" | "red";
 export type BudgetView = {
@@ -22,11 +21,38 @@ export type BudgetView = {
   windows: { label: string; used: number; limit: number }[];
   pace: string;
   source: string;
+  status: string[];
   notes: string[];
 };
-export type DashboardSnapshot = { budget?: BudgetView; agent: string[] };
+export type DelegateView = {
+  role: string;
+  model?: string;
+  status: "running" | "done" | "failed";
+  last: string[];
+};
+export type DashboardSnapshot = {
+  budget?: BudgetView;
+  agent: string[];
+  delegates: Record<string, DelegateView>;
+};
 
-let snapshot: DashboardSnapshot = { agent: [] };
+export function updateDelegate(id: string, patch: Partial<DelegateView>) {
+  const prev = snapshot.delegates[id] ?? {
+    role: "?",
+    status: "running" as const,
+    last: [],
+  };
+  updateDashboard({
+    delegates: { ...snapshot.delegates, [id]: { ...prev, ...patch } },
+  });
+}
+
+export function removeDelegate(id: string) {
+  const { [id]: _gone, ...rest } = snapshot.delegates;
+  updateDashboard({ delegates: rest });
+}
+
+let snapshot: DashboardSnapshot = { agent: [], delegates: {} };
 const listeners = new Set<() => void>();
 let scheduled = false;
 
@@ -34,11 +60,16 @@ export function updateDashboard(patch: Partial<DashboardSnapshot>) {
   snapshot = { ...snapshot, ...patch };
   scheduleWrite();
 }
+
+export function getDashboardSnapshot(): DashboardSnapshot {
+  return snapshot;
+}
 let timer: NodeJS.Timeout | undefined;
 function scheduleWrite() {
   if (timer) return;
   timer = setTimeout(async () => {
     timer = undefined;
+    const stateFile = getStateFile();
     const tmp = `${stateFile}.tmp`;
     await writeFile(tmp, JSON.stringify(snapshot));
     await rename(tmp, stateFile); // atomic: the reader never sees a partial file

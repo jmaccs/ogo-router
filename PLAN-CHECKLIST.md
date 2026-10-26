@@ -2,7 +2,7 @@
 
 Extension that keeps the main loop on a mid-tier model, escalates to strong models only when needed, and steers by Go usage budgets.
 
-**Current implementation:** `ogo/auto` and the M1 Go usage meter are implemented. In the current Pi installation, `opencode-go` models are present in the configured model store and OpenRouter is a built-in provider. The Go usage response schema was supplied as a redacted sample; no authenticated live account request was made. Delegation, escalation tools, review gates, and memory hooks remain future milestones.
+**Progress:** M0 groundwork and M1 routing/budget-meter work are implemented, with live authenticated usage validation still open. M2 isolated delegation is implemented, including role profiles, skill allowlists, usage accounting, task logs, and optional tmux panes. M3 escalation triggers, M4 review/memory hooks, and M5 operational tuning remain incomplete. In the current Pi installation, `opencode-go` models are present in the configured model store and OpenRouter is a built-in provider. The Go usage response schema was supplied as a redacted sample; no authenticated live account request was made.
 
 ## M0. Verify the ground
 
@@ -12,24 +12,25 @@ Settle the unknowns that shape every later step.
 - [ ] **Map Go's catalog to tiers.** List each model's context window and price, then assign T0 to T3.
 - [x] **Decide where T3 comes from.** T3 is configured as OpenRouter Claude Opus; it is separately billed and excluded from Go quota estimates. Credentials and a live request remain unverified.
 - [x] **Read `tui.md` and `types.ts`.** Confirmed `ctx.ui.setStatus`, `ctx.ui.setWidget`, and virtual-model route signatures against the installed Pi 1.3.0 declarations.
-- [ ] **Check `pi --help` for skill flags.** Needed to restrict skills per subagent role.
+- [x] **Check skill isolation support.** Delegated subprocesses use `--no-skills`; only skills in the role allowlist are preloaded into the system prompt.
 - [x] **Find a Go usage source.** `GET https://opencode.ai/zen/go/v1/usage` with `Authorization: Bearer $OPENCODE_API_KEY` is the candidate source.
 - [x] **Verify the usage response shape.** A redacted sample provides `usage.rolling`, `usage.weekly`, and `usage.monthly`, each with `status`, `percent`, and `resetsAt`. Unauthenticated access returned HTTP 401; do not send credentials during development or log/expose the API key. Validate the live authenticated response in the user's environment.
 
 ## M1. Router and budget meter
 
-Virtual model `ogo/auto` with a visible budget. No subagents yet.
+Virtual model `ogo/auto` with budget routing and a live dashboard snapshot.
 
 - [x] **Scaffold the extension.** `index.ts`, `router.json`, and the `ogo.json` category configuration.
 - [x] **Register `ogo/auto`.** `thinkingLevels` of low, medium, high as the frugal-to-quality dial.
 - [x] **Write `route()`.** `direct` uses T0; `user` uses deterministic category heuristics; `continuation` stays sticky.
 - [x] **Write the ledger.** On `message_end`, append provider/model, cost, and timestamp to `~/.pi/agent/ogo-router-usage.jsonl`.
 - [x] **Compute local 5h, weekly, and monthly estimates.** Request-count pace pressure, tier cap by state, with hysteresis.
-- [x] **Add status line and widget.** Three bars, pace markers, current routed model, and pressure state.
+- [x] **Add the budget dashboard.** Three usage bars, pace markers, current routed model, pressure state, API window status, local post-sync request counts, and catalog freshness are rendered in the tmux side panel; informational status is not piped into the main editor.
 - [x] **Add authoritative Go usage snapshots.** Fetch on session start and after settled agent runs, throttled to once per minute; validate and persist snapshots, and surface fetch/schema/persistence errors without exposing credentials.
 - [x] **Use one effective budget source.** Prefer the latest Go percentages. Show the local Pi request count since the snapshot as a separate optimistic delta (not added to percentages because the API reports percentages, not a verified percent-per-request conversion). Without a valid snapshot, use the clearly labeled local estimate; retain a previous snapshot as stale after refresh failures.
 - [x] **Apply endpoint data consistently.** Use rolling, weekly, and monthly `percent` values with `resetsAt` to compute usage and pace; keep separately billed OpenRouter usage outside Go totals. Monthly pace assumes the period starts one calendar month before `resetsAt`.
 - [x] **Test fallback and reconciliation behavior.** Automated tests cover local fallback, successful mocked snapshots, local post-snapshot request counts, stale snapshots, and routing. Live authenticated account validation remains pending.
+- [x] **Add tmux side-panel integration.** Open a detached 42-column side pane at session start, refresh it from the dashboard snapshot, and close it at session shutdown. Non-tmux sessions retain the Pi UI fallback.
 
 ## M2. Delegation
 
@@ -62,6 +63,7 @@ output.
 - [x] **Cap and spill outputs.** Long results go to a file, and the tool returns the path.
 - [x] **Record subagent usage.** Feed usage into the budget ledger and tool result `usage` field, tagging the role and provider so budget gates can account for delegated work.
 - [x] **Preload skills into briefs.** Add a `skills:` allowlist per role; scout and summarizer default to none, while other roles receive only skills needed for their assigned task.
+- [x] **Add task logs and optional tmux output panes.** Each delegate streams to a private log; up to three tasks can have live tail panes under the sidebar, with finished panes closed after a short success/failure-specific delay.
 
 ## M3. Escalation and fallback
 
@@ -72,7 +74,7 @@ Flagship only when needed, and only within budget.
 - [ ] **Wire planner and debugger triggers.** Reuse their M2 role profiles; invoke the planner for complex plans and debugger only with a bounded failure dossier.
 - [ ] **Gate in `tool_call`.** Block or downgrade T3 delegation when the budget is red.
 - [ ] **Add phase transitions in `route()`.** First edit, failure streak, and escalation flag, all inside the cap.
-- [ ] **Implement the retry ladder.** Transient, then rate limit, then capability, then overflow handling.
+- [ ] **Complete the retry ladder.** Implement explicit transient, rate-limit/quota, capability, and context-overflow handling. Main routing retries a transient failure once on the same model, then advances through configured fallbacks; delegates temporarily cool down failed models and try up to three candidates. Explicit error classification and context-overflow handling remain incomplete.
 
 ## M4. Review gate and memory
 

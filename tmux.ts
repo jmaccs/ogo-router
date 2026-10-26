@@ -44,14 +44,29 @@ export async function toggleSidebarPane(sidebarScript: string, stateFile: string
 	await openSidebarPane(sidebarScript, stateFile);
 }
 
-// Subagent output: stack panes under the sidebar, each tailing a log file.
-export async function openDelegatePane(logFile: string, title: string) {
-	if (!sidebarPane || !(await paneAlive(sidebarPane))) return;
+const delegatePanes = new Set<string>();
+const MAX_PANES = 3;
+
+export async function openDelegatePane(
+	logFile: string,
+	title: string,
+): Promise<string | undefined> {
+	if (!sidebarPane || !(await paneAlive(sidebarPane))) return undefined;
+	if (delegatePanes.size >= MAX_PANES) return undefined; // overflow tasks are sidebar-only
 	const id = await tmux(
 		"split-window", "-v", "-d", "-t", sidebarPane,
 		"-P", "-F", "#{pane_id}",
 		`tail -n +1 -F ${JSON.stringify(logFile)}`,
 	);
+	delegatePanes.add(id);
 	await tmux("select-pane", "-t", id, "-T", title);
 	return id;
+}
+
+export function closePaneLater(id: string | undefined, delayMs: number) {
+	if (!id) return;
+	setTimeout(async () => {
+		delegatePanes.delete(id);
+		if (await paneAlive(id)) await tmux("kill-pane", "-t", id).catch(() => {});
+	}, delayMs).unref();
 }

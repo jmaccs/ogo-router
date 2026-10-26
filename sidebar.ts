@@ -26,6 +26,10 @@ function draw() {
 		out.push(`${c.dim}${b.pace}${c.reset}`, `${c.dim}${b.source}${c.reset}`);
 		for (const n of b.notes) out.push(`${c.yellow}${n}${c.reset}`);
 	}
+	if (b?.status?.length) {
+		out.push("", `${c.cyan}${c.bold}Status${c.reset}`);
+		for (const line of b.status) out.push(`${c.dim}${line}${c.reset}`);
+	}
 	process.stdout.write("\x1b[H\x1b[2J" + out.join("\n"));
 }
 

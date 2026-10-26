@@ -60,6 +60,28 @@ routing at tier 1; orange caps at tier 2. Local per-model request caps from
 
 For isolated tests, `OGO_ROUTER_DATA_DIR` overrides the default data directory.
 
+## TUI dashboard
+
+When Pi starts inside tmux, OGO automatically creates a detached 42-column
+split to the right of Pi's pane. This side panel shows the current budget
+pressure and tier, usage bars, pace/source, and warnings. API window status,
+Pi's request counts since the last sync, and models.dev catalog freshness are
+grouped in a **Status** section at the bottom of the panel. The panel refreshes
+from OGO's dashboard snapshot without writing these lines into the main editor
+or its status/widget areas. OGO closes its sidebar pane at session shutdown.
+
+The `/ogo-ui` command is available for the Pi UI sidebar fallback when tmux is
+not available. Delegate output is handled separately: when the OGO tmux
+sidebar is open, up to three delegate log panes can be stacked beneath it.
+Each tails that task's log and closes after completion (15 seconds on success,
+two minutes on failure); additional tasks continue without a dedicated pane.
+Without tmux or an open sidebar, delegation still runs and writes task logs,
+but no delegate pane is opened.
+
+Set `OGO_ROUTER_DATA_DIR` to change the location of the dashboard state file,
+usage ledger, catalog cache, and delegation logs/results from their default
+`~/.pi/agent` directory.
+
 ## Model catalog and pricing
 
 `router.json` configures the models.dev catalog endpoint, provider, refresh
@@ -75,8 +97,8 @@ tier. The input and output values are a relative selection score, not a Go
 quota conversion or a prediction of an individual request's cost. Tool
 capability metadata prevents selecting models explicitly marked as unable to
 call tools. Pricing changes are logged by model ID and shown in the budget
-widget. New models are not automatically added to tiers: `router.json` remains
-the explicit allowlist and budget boundary.
+side panel. New models are not automatically added to tiers: `router.json`
+remains the explicit allowlist and budget boundary.
 
 ## Delegation
 
@@ -100,7 +122,19 @@ marked `parallel: true` (currently scout). Results above 32 KiB are saved under
 returns a bounded excerpt and file path. Delegated assistant usage is appended
 to the usage ledger with its role, provider, model, cost, and timestamps; the
 tool result also reports aggregated token and cost usage, including failed
-attempts that produced usage data.
+attempts that produced usage data. Each task also writes a private log under
+`delegate-logs/`; in tmux, its live output can be viewed in a temporary pane
+below the OGO sidebar.
+
+## Implementation status
+
+The virtual router, Go usage meter, model catalog ranking, and isolated
+delegation tool are implemented. The M3 escalation workflow (explicit
+escalation requests and stuck/review triggers), M4 reviewer gate and durable
+memory hooks, and M5 live-account validation and threshold tuning remain
+planned. The Go usage behavior is covered with mocked responses; it has not
+been validated against a live authenticated account. See
+[`PLAN-CHECKLIST.md`](./PLAN-CHECKLIST.md) for milestone details.
 
 ## Development
 

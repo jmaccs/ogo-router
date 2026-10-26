@@ -15,9 +15,13 @@ describe("OGO router M1", () => {
 	let originalApiKey: string | undefined;
 	let originalFetch: typeof globalThis.fetch;
 	let virtualModel: ExtensionVirtualModel<unknown> | undefined;
+	let readDashboardSnapshot:
+		| (() => { budget?: { source: string; status: string[]; notes: string[] } })
+		| undefined;
 	const handlers = new Map<string, (...args: unknown[]) => unknown>();
 	const status = new Map<string, string>();
 	let widget: string[] = [];
+	let notifications = 0;
 	let models: Array<{ provider: string; id: string }> = [];
 	let fetchAuthorization: string | null = null;
 	let fetchStatus = 200;
@@ -35,7 +39,12 @@ describe("OGO router M1", () => {
 			setWidget(_key: string, content: string[] | undefined) {
 				widget = content ?? [];
 			},
-			notify() {},
+			notify() {
+				notifications++;
+			},
+			custom() {
+				return Promise.resolve();
+			},
 		},
 		modelRegistry: { getAvailable: () => models },
 	} as unknown as ExtensionContext;
@@ -44,6 +53,12 @@ describe("OGO router M1", () => {
 		const handler = handlers.get(event);
 		if (!handler) throw new Error(`Missing ${event} handler`);
 		await handler(data, ctx);
+	}
+
+	function dashboard(): { source: string; status: string[]; notes: string[] } {
+		const budget = readDashboardSnapshot?.().budget;
+		if (!budget) throw new Error("Dashboard budget has not been initialized");
+		return budget;
 	}
 
 	beforeAll(async () => {
@@ -91,6 +106,7 @@ describe("OGO router M1", () => {
 		}) as typeof globalThis.fetch;
 
 		const extension = (await import("./index.ts")).default;
+		readDashboardSnapshot = (await import("./ui.ts")).getDashboardSnapshot;
 		const api = {
 			registerVirtualModel(definition: ExtensionVirtualModel<unknown>) {
 				virtualModel = definition;
@@ -120,8 +136,14 @@ describe("OGO router M1", () => {
 	test("routes requests and reconciles live snapshots with local pending usage", async () => {
 		expect(virtualModel).toBeDefined();
 		await invoke("session_start", { type: "session_start" });
-		expect(widget.join("\n")).toContain("local estimate");
-		expect(widget.join("\n")).toContain("OPENCODE_API_KEY is not set");
+		let budget = dashboard();
+		expect(budget.source).toBeTruthy();
+		expect(budget.status.join("\n")).toContain("API status");
+		expect(budget.status.join("\n")).toContain("models.dev opencode-go:");
+		expect(budget.notes.join("\n")).toContain("OPENCODE_API_KEY is not set");
+		expect(widget).toEqual([]);
+		expect(status.size).toBe(0);
+		expect(notifications).toBe(0);
 
 		const route = virtualModel!.route;
 		const request = {
@@ -149,6 +171,8 @@ describe("OGO router M1", () => {
 			failed: { model: user.model, message: { errorMessage: "quota exceeded" } },
 		} as never, routeContext);
 		expect(retry.model.id).toBe("longcat-2.0");
+		process.env.OPENCODE_API_KEY = "mock-test-key";
+		await invoke("session_start", { type: "session_start" });
 		const allModels = models;
 		models = [{ provider: "openrouter", id: "anthropic/claude-opus-4.8" }];
 		const escalation = await route({
@@ -163,8 +187,13 @@ describe("OGO router M1", () => {
 		process.env.OPENCODE_API_KEY = "mock-test-key";
 		await invoke("session_start", { type: "session_start" });
 		expect(fetchAuthorization).toBe("Bearer mock-test-key");
-		expect(widget.join("\n")).toContain("Go usage live");
-		expect(status.get("ogo-budget")).toContain("Go live");
+		budget = dashboard();
+		expect(budget.source).toContain("Go usage live");
+		expect(budget.status.join("\n")).toContain("API status 5h ok");
+		expect(budget.status.join("\n")).toContain("models.dev opencode-go:");
+		expect(widget).toEqual([]);
+		expect(status.size).toBe(0);
+		expect(notifications).toBe(0);
 
 		await invoke("message_end", {
 			type: "message_end",
@@ -176,18 +205,24 @@ describe("OGO router M1", () => {
 				timestamp: Date.now(),
 			},
 		});
-		expect(widget.join("\n")).toContain("Pi since sync: 5h 1");
+		budget = dashboard();
+		expect(budget.status.join("\n")).toContain("Pi since sync: 5h 1");
 
 		fetchStatus = 503;
 		await invoke("session_start", { type: "session_start" });
-		expect(widget.join("\n")).toContain("Go usage stale");
-		expect(widget.join("\n")).toContain("Pi since sync: 5h 1");
-		expect(status.get("ogo-budget")).toContain("Go stale");
+		budget = dashboard();
+		expect(budget.source).toContain("Go usage stale");
+		expect(budget.status.join("\n")).toContain("Pi since sync: 5h 1");
+		expect(status.size).toBe(0);
+		expect(notifications).toBe(0);
 
 		fetchStatus = 200;
 		usagePercent = { fiveHours: 95, week: 30, month: 20 };
 		await invoke("session_start", { type: "session_start" });
-		expect(status.get("ogo-budget")).toContain("red");
+		budget = dashboard();
+		expect(budget.source).toContain("Go usage live");
+		expect(status.size).toBe(0);
+		expect(notifications).toBe(0);
 		const redBudgetRoute = await route({
 			...request,
 			thinkingLevel: "high",

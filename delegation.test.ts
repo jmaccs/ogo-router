@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -122,6 +122,8 @@ describe("OGO delegation", () => {
 		process.env.PI_CLI_PATH = cliPath;
 
 		let registeredTool: ToolDefinition | undefined;
+		let delegateLogPath = "";
+		let closedPane: { id: string | undefined; delayMs: number } | undefined;
 		const pi = {
 			registerTool(tool: ToolDefinition) {
 				registeredTool = tool;
@@ -138,6 +140,15 @@ describe("OGO delegation", () => {
 			},
 			async recordUsage(messages, role) {
 				recorded.push({ messages, role });
+			},
+			panes: {
+				async open(logPath) {
+					delegateLogPath = logPath;
+					return "delegate-pane";
+				},
+				closeLater(id, delayMs) {
+					closedPane = { id, delayMs };
+				},
 			},
 		}, {
 			"0": ["opencode-go/mimo-v2.5"],
@@ -169,5 +180,8 @@ describe("OGO delegation", () => {
 		expect(recorded[0]?.role).toBe("scout");
 		expect(recorded[0]?.messages).toHaveLength(1);
 		expect(result.usage?.cost.total).toBe(0.25);
+		expect((await readdir(join(tempDir, "delegate-logs"))).length).toBe(1);
+		expect(await readFile(delegateLogPath, "utf8")).toContain(output);
+		expect(closedPane).toEqual({ id: "delegate-pane", delayMs: 15_000 });
 	});
 });
