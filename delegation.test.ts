@@ -113,10 +113,14 @@ describe("OGO delegation", () => {
 			},
 			stopReason: "stop",
 		};
-		const event = JSON.stringify({ type: "message_end", message: assistantMessage });
+		const events = [
+			{ type: "message_end", message: assistantMessage },
+			{ type: "turn_end", message: assistantMessage, toolResults: [] },
+			{ type: "agent_end", messages: [assistantMessage], willRetry: false },
+		].map((event) => JSON.stringify(event)).join("\n");
 		const cliPath = join(tempDir, "fake-pi");
 		const argPath = join(tempDir, "args.json");
-		const script = `#!${process.execPath}\nawait Bun.write(${JSON.stringify(argPath)}, JSON.stringify(process.argv.slice(2)));\nprocess.stdout.write(${JSON.stringify(`${event}\n`)});\n`;
+		const script = `#!${process.execPath}\nawait Bun.write(${JSON.stringify(argPath)}, JSON.stringify(process.argv.slice(2)));\nprocess.stderr.write("diagnostic line\\n");\nprocess.stdout.write(${JSON.stringify(`${events}\n`)});\n`;
 		await Bun.write(cliPath, script);
 		await chmod(cliPath, 0o755);
 		process.env.PI_CLI_PATH = cliPath;
@@ -176,12 +180,64 @@ describe("OGO delegation", () => {
 		expect(text).toContain("Full result saved to:");
 		expect(args.slice(args.indexOf("--tools") + 1, args.indexOf("--tools") + 2)).toEqual(["read,grep,find,ls"]);
 		expect(args).toContain("--no-skills");
+		expect(args).toContain("--no-extensions");
 		expect(recorded).toHaveLength(1);
 		expect(recorded[0]?.role).toBe("scout");
 		expect(recorded[0]?.messages).toHaveLength(1);
 		expect(result.usage?.cost.total).toBe(0.25);
 		expect((await readdir(join(tempDir, "delegate-logs"))).length).toBe(1);
-		expect(await readFile(delegateLogPath, "utf8")).toContain(output);
+		const log = await readFile(delegateLogPath, "utf8");
+		expect(log).toContain(output);
+		expect(log.match(/\[stderr\]/g)).toHaveLength(1);
 		expect(closedPane).toEqual({ id: "delegate-pane", delayMs: 15_000 });
+	});
+
+	test("returns task setup failures without rejecting parallel task aggregation", async () => {
+		const tempDir = await tempDirPromise;
+		let registeredTool: ToolDefinition | undefined;
+		const pi = {
+			registerTool(tool: ToolDefinition) {
+				registeredTool = tool;
+			},
+		} as unknown as ExtensionAPI;
+		registerDelegation(pi, {
+			dataDir: tempDir,
+			async getBudgetCap() {
+				return 0;
+			},
+			getModelCatalog() {
+				throw new Error("catalog unavailable");
+			},
+			async recordUsage() {},
+		}, {
+			"0": ["opencode-go/mimo-v2.5"],
+			"1": [],
+			"2": [],
+			"3": [],
+		});
+		const context = {
+			cwd: tempDir,
+			tools: [],
+			modelRegistry: {
+				getAvailable: () => [{ provider: "opencode-go", id: "mimo-v2.5" }],
+			},
+		} as unknown as ExtensionToolContext;
+
+		const result = await registeredTool!.execute(
+			"test-parallel-delegate",
+			{
+				tasks: [
+					{ role: "scout", task: "Inspect one." },
+					{ role: "scout", task: "Inspect another." },
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+		const text = result.content.find((block) => block.type === "text")?.text ?? "";
+
+		expect(result.isError).toBe(true);
+		expect(text.match(/catalog unavailable/g)).toHaveLength(2);
 	});
 });

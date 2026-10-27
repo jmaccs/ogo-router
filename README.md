@@ -102,11 +102,12 @@ remains the explicit allowlist and budget boundary.
 
 ## Delegation
 
-The `delegate` tool launches isolated `pi --mode json -p --no-session`
-subprocesses. Each invocation receives only its bounded task brief, acceptance
-criteria, role instructions, and explicitly allowlisted skill content; it does
-not inherit the conductor's conversation. The conductor remains responsible for
-choosing a role, integrating results, and accepting edits.
+The `delegate` tool launches isolated `pi --mode json -p --no-session
+--no-extensions` subprocesses. Each invocation receives only its bounded task
+brief, acceptance criteria, role instructions, and explicitly allowlisted skill
+content; it does not inherit the conductor's conversation or load extensions
+that could duplicate parent-side usage accounting. The conductor remains
+responsible for choosing a role, integrating results, and accepting edits.
 
 Role profiles and their output contracts live in [`agents/`](./agents/). Their
 `tier` and `fallback_tiers` are clamped to the current budget cap and available

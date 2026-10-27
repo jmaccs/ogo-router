@@ -234,3 +234,81 @@ delegate tool with scout, worker and mechanic, adapted from the stock subagent e
 Escalation: request_escalation, the stuck detector, planner and debugger roles, and the budget gate.
 Review gate and the compaction and memory hooks.
 Verify and integrate the Go usage endpoint, then harden snapshot/delta reconciliation and the labeled local fallback.
+
+## Reliability fixes backlog
+
+The following work was identified in the routing and delegation review. Keep
+these fixes separate from the M3-M5 feature milestones so reliability work can
+be validated before adding more orchestration behavior.
+
+### R1. Delegation correctness and lifecycle
+
+- [x] Handle stderr with one stream listener, retain its most recent 64 KiB,
+  and truncate large text using buffer slices.
+- [x] Consume only authoritative child `message_end` events and deduplicate
+  assistant usage by message timestamp.
+- [x] Start child Pi processes with `--no-extensions` to avoid loading OGO in
+  the child and recording the same usage twice.
+- [x] Load role files lazily during tool execution and return role-load errors
+  as delegate tool errors.
+- [x] Catch per-task setup errors and settle parallel tasks so one rejection
+  cannot orphan sibling scouts.
+- [ ] Move large system/user prompts out of process arguments to avoid
+  per-argument size limits and exposing task content in process listings.
+
+### R2. Router fallback and budget enforcement
+
+- [ ] Keep failed-model cooldowns in routing state and filter after fallback
+  expansion; persist cooldowns only if cross-restart behavior is needed.
+- [ ] Order fallbacks from the selected tier toward cheaper tiers first.
+- [ ] Enforce tier caps during continuations and add a per-request spend ceiling
+  checked when assistant usage is recorded.
+- [ ] Keep T3 models out of the conductor route; use them only for explicitly
+  budget-gated planner/debugger delegation. Add configurable session/day dollar
+  caps for separately billed non-Go providers.
+- [ ] Classify retry failures precisely (429/quota, 5xx, network, timeout,
+  context/capability, and task failure) so only safe provider failures retry.
+
+### R3. Usage accounting and category stability
+
+- [ ] Tolerate malformed/torn ledger lines with a warning and maintain an
+  in-memory ledger index rather than reparsing the entire file on each route.
+- [ ] Estimate local utilization as per-model request fractions against each
+  model's configured quota, and use a rolling five-hour window.
+- [ ] Correct early-window pace behavior in both local and snapshot meters.
+- [ ] Keep the task category sticky across acknowledgments and permit new
+  evidence to escalate, but not silently downgrade, the category.
+
+### R4. Safe and bounded delegation
+
+- [ ] Isolate editable attempts in per-attempt Git worktrees. Preserve partial
+  output and diffs after timeout/failure; do not retry an edited tree without
+  returning to a clean attempt.
+- [ ] Retry/cool down only classified provider failures; add provider-level
+  cooldowns, jitter, half-open probes, and provider diversity.
+- [ ] Enforce read-only roles using tool allowlists, and validate editable-role
+  diffs against an explicit allowed-path list before accepting results.
+- [ ] Replace the single two-minute wall-clock timeout with per-role idle
+  timeouts; return partial transcript and editable diff on timeout.
+- [ ] Reserve estimated delegate spend before launch, reconcile actual usage
+  afterward, and report cost and remaining headroom. Account for concurrent
+  reservations.
+
+### R5. Verification and evidence-based escalation
+
+- [ ] Run configured tests/typecheck/lint after a worker completion claim and
+  use deterministic failures and unexpectedly broad diffs as escalation
+  signals.
+- [ ] Estimate percent-per-request conversion from consecutive API snapshots
+  and model-weighted observed usage; smooth it and validate it before using the
+  estimate for routing or pre-flight reservation.
+
+### Decisions before R4
+
+- Choose per-attempt Git worktrees as the isolation mechanism (recommended),
+  including how accepted changes are applied to the conductor's working tree.
+- Set idle timeout values by role.
+- Define the editable-role allowed-path format and whether out-of-scope diffs
+  are rejected or merely reported.
+- Configure session/day dollar caps and reservation behavior for concurrent
+  delegation.

@@ -216,8 +216,6 @@ export async function loadDelegationRoles(): Promise<Map<string, RoleProfile>> {
   return roles;
 }
 
-const roleLoad = loadDelegationRoles();
-
 function emptyUsage(): AssistantUsage {
   return {
     input: 0,
@@ -280,10 +278,26 @@ function addAssistantMessages(
 
 function byteTruncate(text: string, maxBytes: number): string {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  let output = text;
-  while (Buffer.byteLength(output, "utf8") > maxBytes - 64)
-    output = output.slice(0, -1);
-  return `${output}\n\n[truncated at ${maxBytes} bytes]`;
+  const marker = "\n\n[truncated]";
+  const contentLimit = Math.max(
+    0,
+    maxBytes - Buffer.byteLength(marker, "utf8"),
+  );
+  const output = Buffer.from(text, "utf8")
+    .subarray(0, contentLimit)
+    .toString("utf8");
+  return `${output}${marker}`;
+}
+
+function byteTruncateTail(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  const marker = "[stderr truncated; showing tail]\n\n";
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  const contentLimit = Math.max(0, maxBytes - markerBytes);
+  const bytes = Buffer.from(text, "utf8");
+  const tail = (contentLimit ? bytes.subarray(-contentLimit) : Buffer.alloc(0))
+    .toString("utf8");
+  return `${marker}${tail}`;
 }
 
 function isAssistantMessage(value: unknown): value is Record<
@@ -459,7 +473,15 @@ async function runModel(
   ]
     .filter(Boolean)
     .join("\n\n");
-  const args = ["--mode", "json", "-p", "--no-session", "--model", model];
+  const args = [
+    "--mode",
+    "json",
+    "-p",
+    "--no-session",
+    "--no-extensions",
+    "--model",
+    model,
+  ];
   if (tools.length) args.push("--tools", tools.join(","));
   else args.push("--no-tools");
   args.push("--exclude-tools", "delegate", "--no-skills");
@@ -474,6 +496,7 @@ async function runModel(
     attempts: [model],
   };
   const messages: unknown[] = [];
+  const messageTimestamps = new Set<number>();
   let stderr = "";
   const stdoutDecoder = new StringDecoder("utf8");
   const stderrDecoder = new StringDecoder("utf8");
@@ -497,16 +520,30 @@ async function runModel(
       terminateChild();
       return;
     }
-    if (typeof event !== "object" || event === null || !("message" in event))
+    if (
+      typeof event !== "object" ||
+      event === null ||
+      !("type" in event) ||
+      event.type !== "message_end" ||
+      !("message" in event)
+    )
       return;
     const message = event.message;
     if (!isAssistantMessage(message)) return;
+    if (!Number.isFinite(message.timestamp)) {
+      protocolError ??= new Error(
+        "Delegated Pi process returned an assistant message with invalid timestamp",
+      );
+      terminateChild();
+      return;
+    }
+    if (messageTimestamps.has(message.timestamp))
+      return;
     if (
       typeof message.provider !== "string" ||
       !message.provider ||
       typeof message.model !== "string" ||
       !message.model ||
-      !Number.isFinite(message.timestamp) ||
       !("usage" in message) ||
       typeof message.usage !== "object" ||
       message.usage === null ||
@@ -523,6 +560,7 @@ async function runModel(
       terminateChild();
       return;
     }
+    messageTimestamps.add(message.timestamp);
     messages.push(message);
     const text = getText(message);
     if (text) {
@@ -544,12 +582,6 @@ async function runModel(
       }
     }
 
-    // stderr handler:
-    child.stderr.on("data", (chunk: Buffer) => {
-      const s = stderrDecoder.write(chunk);
-      stderr = byteTruncate(stderr + s, maxStderrBytes);
-      if (s.trim()) log(`[stderr] ${s.trimEnd()}`);
-    });
   };
 
   const command = process.env.PI_CLI_PATH || "pi";
@@ -597,10 +629,9 @@ async function runModel(
       for (const line of lines) processMessage(line);
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr = byteTruncate(
-        stderr + stderrDecoder.write(chunk),
-        maxStderrBytes,
-      );
+      const text = stderrDecoder.write(chunk);
+      stderr = byteTruncateTail(stderr + text, maxStderrBytes);
+      if (text.trim()) log(`[stderr] ${text.trimEnd()}`);
     });
     child.once("error", (error) => {
       processError ??= error;
@@ -610,7 +641,9 @@ async function runModel(
       clearTimeout(timeout);
       if (killTimer) clearTimeout(killTimer);
       buffer += stdoutDecoder.end();
-      stderr = byteTruncate(stderr + stderrDecoder.end(), maxStderrBytes);
+      const finalStderr = stderrDecoder.end();
+      stderr = byteTruncateTail(stderr + finalStderr, maxStderrBytes);
+      if (finalStderr.trim()) log(`[stderr] ${finalStderr.trimEnd()}`);
       if (buffer.trim()) processMessage(buffer);
       processError ??= protocolError;
       resolveExit(code ?? 1);
@@ -697,7 +730,25 @@ export function registerDelegation(
           isError: true,
         };
       }
-      const roles = await roleLoad;
+      let roles: Map<string, RoleProfile>;
+      try {
+        roles = await loadDelegationRoles();
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Could not load delegation roles: ${errorResult(error)}`,
+            },
+          ],
+          details: {
+            mode: parallel ? "parallel" : "single",
+            results: [],
+            usage: emptyUsage(),
+          },
+          isError: true,
+        };
+      }
       const tasks: Task[] = single
         ? [
             {
@@ -818,10 +869,10 @@ export function registerDelegation(
           status: "running",
           last: ["Starting isolated Pi process…"],
         });
-        const paneId = await options.panes?.open(log.path, role.name);
-
+        let paneId: string | undefined;
         let result: SubtaskResult | undefined;
         try {
+          paneId = await options.panes?.open(log.path, role.name);
           const tools = toolsForRole(role, ctx);
           const skills = await loadDelegationSkills(role, ctx.cwd);
           const candidates = modelCandidates(
@@ -910,6 +961,15 @@ export function registerDelegation(
             result.outputPath = capped.outputPath;
           }
           return result;
+        } catch (error) {
+          const message = errorResult(error);
+          fail(`${role.name}: ${message}`);
+          log.write(`✗ ${message}`);
+          updateDelegate(taskId, {
+            status: "failed",
+            last: [`✗ ${message}`.slice(0, 200)],
+          });
+          return undefined;
         } finally {
           const cancelled = !result && signal?.aborted;
           log.write(result ? "\n✓ done" : cancelled ? "\n⊘ cancelled" : "\n✗ failed");
@@ -931,11 +991,14 @@ export function registerDelegation(
         }
       };
       if (parallel) {
-        results.push(
-          ...(await Promise.all(tasks.map(runTask))).filter(
-            (result): result is SubtaskResult => !!result,
-          ),
-        );
+        const settled = await Promise.allSettled(tasks.map(runTask));
+        for (const outcome of settled) {
+          if (outcome.status === "fulfilled") {
+            if (outcome.value) results.push(outcome.value);
+          } else {
+            failures.push(`Delegate task failed: ${errorResult(outcome.reason)}`);
+          }
+        }
       } else {
         const result = await runTask(tasks[0]!);
         if (result) results.push(result);
