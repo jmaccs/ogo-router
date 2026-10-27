@@ -286,7 +286,7 @@ be validated before adding more orchestration behavior.
 - [ ] Isolate editable attempts in per-attempt Git worktrees. Preserve partial
   output and diffs after timeout/failure; do not retry an edited tree without
   returning to a clean attempt.
-- [ ] Retry/cool down only classified provider failures; add provider-level
+- [x] Retry/cool down only classified provider failures; add provider-level
   cooldowns, jitter, half-open probes, and provider diversity.
 - [ ] Enforce read-only roles using tool allowlists, and validate editable-role
   diffs against an explicit allowed-path list before accepting results.

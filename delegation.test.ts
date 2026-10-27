@@ -78,6 +78,28 @@ describe("OGO delegation", () => {
 			"opencode-go/t1-expensive",
 			"opencode-go/t0",
 		]);
+
+		const spread = getDelegateTierCandidates(
+			{ ...worker!, tier: 0, fallbackTiers: [] },
+			0,
+			{
+				"0": [
+					"opencode-go/provider-a1",
+					"opencode-go/provider-a2",
+					"openrouter/provider-b",
+				],
+			},
+			[
+				{ provider: "opencode-go", id: "provider-a1" },
+				{ provider: "opencode-go", id: "provider-a2" },
+				{ provider: "openrouter", id: "provider-b" },
+			],
+		);
+		expect(spread).toEqual([
+			"opencode-go/provider-a1",
+			"openrouter/provider-b",
+			"opencode-go/provider-a2",
+		]);
 	});
 
 	test("preloads only skills named in the role allowlist", async () => {
@@ -239,5 +261,310 @@ describe("OGO delegation", () => {
 
 		expect(result.isError).toBe(true);
 		expect(text.match(/catalog unavailable/g)).toHaveLength(2);
+	});
+
+	test("retries provider faults across providers but not ordinary task failures", async () => {
+		const tempDir = await tempDirPromise;
+		const invocationPath = join(tempDir, "provider-retry-count");
+		const cliPath = join(tempDir, "provider-retry-pi");
+		const successMessage = {
+			role: "assistant",
+			provider: "openrouter",
+			model: "provider-b",
+			timestamp: Date.now() + 1,
+			content: [{ type: "text", text: "Recovered on another provider." }],
+			usage: { cost: { total: 0 } },
+			stopReason: "stop",
+		};
+		const failureMessage = {
+			role: "assistant",
+			provider: "opencode-go",
+			model: "provider-a1",
+			timestamp: Date.now(),
+			content: [{ type: "text", text: "Temporary provider error." }],
+			usage: { cost: { total: 0 } },
+			stopReason: "error",
+			errorMessage: "HTTP 503 Service Unavailable",
+		};
+		const script = `#!${process.execPath}\nconst invocationPath = ${JSON.stringify(invocationPath)};\nlet count = 0;\ntry { count = Number(await Bun.file(invocationPath).text()); } catch {}\ncount++;\nawait Bun.write(invocationPath, String(count));\nconst model = process.argv[process.argv.indexOf("--model") + 1];\nconst event = model === "openrouter/provider-b" ? ${JSON.stringify({ type: "message_end", message: successMessage })} : ${JSON.stringify({ type: "message_end", message: failureMessage })};\nprocess.stdout.write(JSON.stringify(event) + "\\n");\n`;
+		await Bun.write(cliPath, script);
+		await chmod(cliPath, 0o755);
+		process.env.PI_CLI_PATH = cliPath;
+
+		let registeredTool: ToolDefinition | undefined;
+		const pi = {
+			registerTool(tool: ToolDefinition) {
+				registeredTool = tool;
+			},
+		} as unknown as ExtensionAPI;
+		registerDelegation(pi, {
+			dataDir: tempDir,
+			async getBudgetCap() {
+				return 0;
+			},
+			getModelCatalog() {
+				return undefined;
+			},
+			async recordUsage() {},
+		}, {
+			"0": [
+				"opencode-go/provider-a1",
+				"opencode-go/provider-a2",
+				"openrouter/provider-b",
+			],
+			"1": [],
+			"2": [],
+			"3": [],
+		});
+		const context = {
+			cwd: tempDir,
+			tools: ["read", "grep", "find", "ls"].map((name) => ({ name })),
+			modelRegistry: {
+				getAvailable: () => [
+					{ provider: "opencode-go", id: "provider-a1" },
+					{ provider: "opencode-go", id: "provider-a2" },
+					{ provider: "openrouter", id: "provider-b" },
+				],
+			},
+		} as unknown as ExtensionToolContext;
+
+		const result = await registeredTool!.execute(
+			"test-provider-retry",
+			{ role: "scout", task: "Inspect provider retry behavior." },
+			undefined,
+			undefined,
+			context,
+		);
+		const details = result.details as {
+			results: Array<{ attempts: string[]; output: string }>;
+		};
+
+		expect(await readFile(invocationPath, "utf8")).toBe("2");
+		expect(details.results[0]?.attempts).toEqual([
+			"opencode-go/provider-a1",
+			"openrouter/provider-b",
+		]);
+		expect(details.results[0]?.output).toContain("Recovered");
+	});
+
+	test("does not retry an editable role after it has issued a tool call", async () => {
+		const tempDir = await tempDirPromise;
+		const invocationPath = join(tempDir, "editable-retry-count");
+		const cliPath = join(tempDir, "editable-retry-pi");
+		const message = {
+			role: "assistant",
+			provider: "opencode-go",
+			model: "editable-a1",
+			timestamp: Date.now(),
+			content: [
+				{ type: "toolCall", id: "edit-1", name: "edit", arguments: {} },
+				{ type: "text", text: "The edit was started." },
+			],
+			usage: { cost: { total: 0 } },
+			stopReason: "error",
+			errorMessage: "HTTP 503 Service Unavailable",
+		};
+		const script = `#!${process.execPath}\nconst invocationPath = ${JSON.stringify(invocationPath)};\nlet count = 0;\ntry { count = Number(await Bun.file(invocationPath).text()); } catch {}\nawait Bun.write(invocationPath, String(count + 1));\nprocess.stdout.write(JSON.stringify(${JSON.stringify({ type: "message_end", message })}) + "\\n");\n`;
+		await Bun.write(cliPath, script);
+		await chmod(cliPath, 0o755);
+		process.env.PI_CLI_PATH = cliPath;
+
+		let registeredTool: ToolDefinition | undefined;
+		const pi = {
+			registerTool(tool: ToolDefinition) {
+				registeredTool = tool;
+			},
+		} as unknown as ExtensionAPI;
+		registerDelegation(pi, {
+			dataDir: tempDir,
+			async getBudgetCap() {
+				return 1;
+			},
+			getModelCatalog() {
+				return undefined;
+			},
+			async recordUsage() {},
+		}, {
+			"0": ["opencode-go/edit-a0"],
+			"1": ["opencode-go/editable-a1", "openrouter/editable-b"],
+			"2": [],
+			"3": [],
+		});
+		const context = {
+			cwd: tempDir,
+			tools: ["read", "grep", "find", "ls", "edit", "write"].map((name) => ({ name })),
+			modelRegistry: {
+				getAvailable: () => [
+					{ provider: "opencode-go", id: "editable-a1" },
+					{ provider: "openrouter", id: "editable-b" },
+					{ provider: "opencode-go", id: "edit-a0" },
+				],
+			},
+		} as unknown as ExtensionToolContext;
+
+		const result = await registeredTool!.execute(
+			"test-editable-retry",
+			{ role: "worker", task: "Make the assigned edit." },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(await readFile(invocationPath, "utf8")).toBe("1");
+		expect(result.isError).toBe(true);
+	});
+
+	test("does not cool down or retry a model for an ordinary task error", async () => {
+		const tempDir = await tempDirPromise;
+		const invocationPath = join(tempDir, "task-error-count");
+		const cliPath = join(tempDir, "task-error-pi");
+		const message = {
+			role: "assistant",
+			provider: "opencode-go",
+			model: "task-error-a1",
+			timestamp: Date.now(),
+			content: [{ type: "text", text: "The requested operation is invalid." }],
+			usage: { cost: { total: 0 } },
+			stopReason: "error",
+			errorMessage: "Invalid task input: expected 429 tokens of context.",
+		};
+		const script = `#!${process.execPath}\nconst invocationPath = ${JSON.stringify(invocationPath)};\nlet count = 0;\ntry { count = Number(await Bun.file(invocationPath).text()); } catch {}\nawait Bun.write(invocationPath, String(count + 1));\nprocess.stdout.write(JSON.stringify(${JSON.stringify({ type: "message_end", message })}) + "\\n");\n`;
+		await Bun.write(cliPath, script);
+		await chmod(cliPath, 0o755);
+		process.env.PI_CLI_PATH = cliPath;
+
+		let registeredTool: ToolDefinition | undefined;
+		const pi = {
+			registerTool(tool: ToolDefinition) {
+				registeredTool = tool;
+			},
+		} as unknown as ExtensionAPI;
+		registerDelegation(pi, {
+			dataDir: tempDir,
+			async getBudgetCap() {
+				return 0;
+			},
+			getModelCatalog() {
+				return undefined;
+			},
+			async recordUsage() {},
+		}, {
+			"0": [
+				"opencode-go/task-error-a1",
+				"opencode-go/task-error-a2",
+				"openrouter/task-error-b",
+			],
+			"1": [],
+			"2": [],
+			"3": [],
+		});
+		const context = {
+			cwd: tempDir,
+			tools: ["read", "grep", "find", "ls"].map((name) => ({ name })),
+			modelRegistry: {
+				getAvailable: () => [
+					{ provider: "opencode-go", id: "task-error-a1" },
+					{ provider: "opencode-go", id: "task-error-a2" },
+					{ provider: "openrouter", id: "task-error-b" },
+				],
+			},
+		} as unknown as ExtensionToolContext;
+
+		const result = await registeredTool!.execute(
+			"test-task-error",
+			{ role: "scout", task: "Run the unsupported operation." },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(await readFile(invocationPath, "utf8")).toBe("1");
+		expect(result.isError).toBe(true);
+		await registeredTool!.execute(
+			"test-task-error-again",
+			{ role: "scout", task: "Run the unsupported operation again." },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(await readFile(invocationPath, "utf8")).toBe("2");
+	});
+
+	test("opens a provider circuit after repeated provider faults", async () => {
+		const tempDir = await tempDirPromise;
+		const invocationPath = join(tempDir, "circuit-failure-count");
+		const cliPath = join(tempDir, "circuit-pi");
+		const message = {
+			role: "assistant",
+			provider: "test-provider",
+			model: "model-a1",
+			timestamp: Date.now(),
+			content: [{ type: "text", text: "Provider unavailable." }],
+			usage: { cost: { total: 0 } },
+			stopReason: "error",
+			errorMessage: "HTTP 503 Service Unavailable",
+		};
+		const script = `#!${process.execPath}\nconst invocationPath = ${JSON.stringify(invocationPath)};\nlet count = 0;\ntry { count = Number(await Bun.file(invocationPath).text()); } catch {}\nawait Bun.write(invocationPath, String(count + 1));\nprocess.stdout.write(JSON.stringify(${JSON.stringify({ type: "message_end", message })}) + "\\n");\n`;
+		await Bun.write(cliPath, script);
+		await chmod(cliPath, 0o755);
+		process.env.PI_CLI_PATH = cliPath;
+
+		let registeredTool: ToolDefinition | undefined;
+		const pi = {
+			registerTool(tool: ToolDefinition) {
+				registeredTool = tool;
+			},
+		} as unknown as ExtensionAPI;
+		const tierModels = {
+			"0": [
+				"test-provider/model-a1",
+				"test-provider/model-a2",
+				"test-provider/model-a3",
+			],
+			"1": [],
+			"2": [],
+			"3": [],
+		};
+		registerDelegation(pi, {
+			dataDir: tempDir,
+			async getBudgetCap() {
+				return 0;
+			},
+			getModelCatalog() {
+				return undefined;
+			},
+			async recordUsage() {},
+		}, tierModels);
+		const context = {
+			cwd: tempDir,
+			tools: ["read", "grep", "find", "ls"].map((name) => ({ name })),
+			modelRegistry: {
+				getAvailable: () =>
+					tierModels["0"]!.map((ref) => ({
+						provider: "test-provider",
+						id: ref.slice("test-provider/".length),
+					})),
+			},
+		} as unknown as ExtensionToolContext;
+
+		const first = await registeredTool!.execute(
+			"test-provider-circuit",
+			{ role: "scout", task: "Check provider availability." },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(first.isError).toBe(true);
+		expect(await readFile(invocationPath, "utf8")).toBe("2");
+
+		const second = await registeredTool!.execute(
+			"test-provider-circuit-open",
+			{ role: "scout", task: "Check whether the circuit is open." },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(second.isError).toBe(true);
+		expect(await readFile(invocationPath, "utf8")).toBe("2");
 	});
 });

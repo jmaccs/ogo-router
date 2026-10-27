@@ -24,7 +24,32 @@ const maxProcessOutputBytes = 8 * 1024 * 1024;
 const maxStderrBytes = 64 * 1024;
 const processTimeoutMs = 2 * 60 * 1000;
 const circuitCooldownMs = 60 * 1000;
+const providerFailureThreshold = 2;
 const modelCooldowns = new Map<string, number>();
+type ProviderCircuit = {
+  failures: number;
+  openUntil: number;
+  halfOpenInFlight: boolean;
+};
+type ProviderFailureKind =
+  | "rate-limit"
+  | "server"
+  | "network"
+  | "timeout"
+  | "other";
+const providerCircuits = new Map<string, ProviderCircuit>();
+
+class DelegateAttemptError extends Error {
+  constructor(
+    message: string,
+    readonly kind: ProviderFailureKind,
+    readonly toolCallsOccurred: boolean,
+    readonly providerResponded = false,
+  ) {
+    super(message);
+    this.name = "DelegateAttemptError";
+  }
+}
 
 type RoleTier = 0 | 1 | 2 | 3;
 type RoleFrontmatter = {
@@ -423,19 +448,135 @@ function modelCandidates(
         const tierCandidates = (tierModels[String(tier)] ?? []).filter(
           (model) => available.has(model),
         );
-        return rankCatalogModels(
-          tierCandidates,
-          "opencode-go",
-          catalog,
-          requiresToolCalls,
+        return spreadProviders(
+          rankCatalogModels(
+            tierCandidates,
+            "opencode-go",
+            catalog,
+            requiresToolCalls,
+          ),
         );
       }),
     ),
   ];
   const healthy = candidates.filter(
-    (model) => (modelCooldowns.get(model) ?? 0) <= now,
+    (model) =>
+      (modelCooldowns.get(model) ?? 0) <= now &&
+      !providerIsOpen(providerFromModel(model), now),
   );
   return healthy.slice(0, 12);
+}
+
+function providerFromModel(model: string): string {
+  const separator = model.indexOf("/");
+  return separator < 1 ? model : model.slice(0, separator);
+}
+
+function providerIsOpen(provider: string, now = Date.now()): boolean {
+  const circuit = providerCircuits.get(provider);
+  return Boolean(
+    circuit &&
+      circuit.failures >= providerFailureThreshold &&
+      circuit.openUntil > now,
+  );
+}
+
+function acquireProvider(provider: string, now = Date.now()): boolean {
+  const circuit = providerCircuits.get(provider);
+  if (!circuit || circuit.failures < providerFailureThreshold) return true;
+  if (circuit.openUntil > now || circuit.halfOpenInFlight) return false;
+  circuit.halfOpenInFlight = true;
+  return true;
+}
+
+function recordProviderSuccess(provider: string): void {
+  providerCircuits.delete(provider);
+}
+
+function releaseProviderProbe(provider: string): void {
+  const circuit = providerCircuits.get(provider);
+  if (!circuit) return;
+  if (circuit.failures >= providerFailureThreshold) {
+    circuit.halfOpenInFlight = false;
+    circuit.openUntil =
+      Date.now() + circuitCooldownMs * (0.8 + Math.random() * 0.4);
+    return;
+  }
+  circuit.halfOpenInFlight = false;
+}
+
+function recordProviderFailure(provider: string, now = Date.now()): void {
+  const circuit = providerCircuits.get(provider) ?? {
+    failures: 0,
+    openUntil: 0,
+    halfOpenInFlight: false,
+  };
+  const wasHalfOpen =
+    circuit.failures >= providerFailureThreshold && circuit.halfOpenInFlight;
+  circuit.halfOpenInFlight = false;
+  circuit.failures++;
+  if (circuit.failures >= providerFailureThreshold || wasHalfOpen) {
+    const jitter = 0.8 + Math.random() * 0.4;
+    circuit.openUntil = now + circuitCooldownMs * jitter;
+  }
+  providerCircuits.set(provider, circuit);
+}
+
+function providerFailureKind(
+  message: string,
+  error?: unknown,
+): ProviderFailureKind {
+  const code =
+    typeof error === "object" && error !== null && "code" in error
+      ? String(error.code)
+      : "";
+  if (
+    /\bHTTP\s*429\b|\bstatus(?:\s+code)?\s*429\b|\b429\s+(?:too many requests|rate.?limit)\b|rate.?limit|quota exceeded|too many requests|resource exhausted/i.test(
+      message,
+    )
+  )
+    return "rate-limit";
+  if (
+    /\b(?:HTTP\s*|status(?:\s+code)?\s*)5\d{2}\b|\b5\d{2}\s+(?:server|internal server)\b/i.test(
+      message,
+    )
+  )
+    return "server";
+  if (
+    /^(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN)$/.test(
+      code,
+    ) ||
+    /fetch failed|network error|connection (?:reset|refused|closed|lost)/i.test(
+      message,
+    )
+  )
+    return "network";
+  if (/delegate timed out|timed out after \d+s/i.test(message))
+    return "timeout";
+  return "other";
+}
+
+function isProviderFault(kind: ProviderFailureKind): boolean {
+  return kind === "rate-limit" || kind === "server" || kind === "network";
+}
+
+function spreadProviders(candidates: readonly string[]): string[] {
+  const providers = new Map<string, string[]>();
+  for (const candidate of candidates) {
+    const provider = providerFromModel(candidate);
+    const bucket = providers.get(provider) ?? [];
+    bucket.push(candidate);
+    providers.set(provider, bucket);
+  }
+  const ordered: string[] = [];
+  while (providers.size) {
+    for (const [provider, bucket] of providers) {
+      const model = bucket.shift();
+      if (model) ordered.push(model);
+      if (!bucket.length) providers.delete(provider);
+    }
+  }
+  return ordered;
 }
 
 async function runModel(
@@ -497,6 +638,7 @@ async function runModel(
   };
   const messages: unknown[] = [];
   const messageTimestamps = new Set<number>();
+  let toolCallsOccurred = false;
   let stderr = "";
   const stdoutDecoder = new StringDecoder("utf8");
   const stderrDecoder = new StringDecoder("utf8");
@@ -577,6 +719,7 @@ async function runModel(
           part.type === "toolCall" &&
           "name" in part
         ) {
+          toolCallsOccurred = true;
           log(`→ ${String(part.name)}`);
         }
       }
@@ -654,9 +797,18 @@ async function runModel(
   await onUsage(messages, role.name);
   addAssistantMessages(result.usage, messages);
 
-  if (processError) throw processError;
+  if (processError)
+    throw new DelegateAttemptError(
+      processError.message,
+      providerFailureKind(processError.message, processError),
+      toolCallsOccurred,
+    );
   if (aborted || signal?.aborted)
-    throw new Error(`Delegate "${role.name}" was cancelled`);
+    throw new DelegateAttemptError(
+      `Delegate "${role.name}" was cancelled`,
+      "other",
+      toolCallsOccurred,
+    );
   const lastMessage = [...messages].reverse().find(isAssistantMessage);
   if (
     exitCode !== 0 ||
@@ -668,7 +820,20 @@ async function runModel(
       (lastMessage && typeof lastMessage.errorMessage === "string"
         ? lastMessage.errorMessage
         : `Pi exited with code ${exitCode}`);
-    throw new Error(reason);
+    const failureEvidence = [
+      stderr,
+      lastMessage &&
+      typeof lastMessage.errorMessage === "string"
+        ? lastMessage.errorMessage
+        : "",
+      `Pi exited with code ${exitCode}`,
+    ].join("\n");
+    throw new DelegateAttemptError(
+      reason,
+      providerFailureKind(failureEvidence),
+      toolCallsOccurred,
+      Boolean(lastMessage),
+    );
   }
   return result;
 }
@@ -918,9 +1083,18 @@ export function registerDelegation(
             }
           };
 
-          const attemptModels = candidates.slice(0, maxAttempts);
-          for (const [index, model] of attemptModels.entries()) {
-            log.write(`── attempt ${index + 1}/${attemptModels.length}: ${model} ──`);
+          const attemptedModels: string[] = [];
+          for (const model of candidates) {
+            if (attemptedModels.length >= maxAttempts) break;
+            const provider = providerFromModel(model);
+            if (!acquireProvider(provider)) {
+              log.write(`── skipped ${model}: provider circuit is open ──`);
+              continue;
+            }
+            attemptedModels.push(model);
+            log.write(
+              `── attempt ${attemptedModels.length}/${maxAttempts}: ${model} ──`,
+            );
             updateDelegate(taskId, { model, status: "running" });
             try {
               result = await runModel(
@@ -939,19 +1113,49 @@ export function registerDelegation(
                   }),
                 log.write,
               );
+              recordProviderSuccess(provider);
+              result.attempts = [...attemptedModels];
               break;
             } catch (error) {
               if (signal?.aborted) {
+                releaseProviderProbe(provider);
                 fail(`${role.name}: delegated task was cancelled`);
                 break;
               }
-              modelCooldowns.set(model, Date.now() + circuitCooldownMs);
+              const attemptError =
+                error instanceof DelegateAttemptError
+                  ? error
+                  : new DelegateAttemptError(
+                      errorResult(error),
+                      providerFailureKind(errorResult(error), error),
+                      false,
+                    );
+              const providerFault = isProviderFault(attemptError.kind);
+              if (providerFault) {
+                recordProviderFailure(provider);
+                const jitter = 0.8 + Math.random() * 0.4;
+                const duration =
+                  attemptError.kind === "rate-limit"
+                    ? circuitCooldownMs * 2
+                    : circuitCooldownMs;
+                modelCooldowns.set(
+                  model,
+                  Date.now() + duration * jitter,
+                );
+              } else if (attemptError.providerResponded) {
+                recordProviderSuccess(provider);
+              } else {
+                releaseProviderProbe(provider);
+              }
               const message = errorResult(error);
               fail(`${role.name} on ${model}: ${message}`);
               log.write(`✗ ${message}`);
               updateDelegate(taskId, {
                 last: [`✗ ${model}: ${message}`.slice(0, 200)],
               });
+              const canRetry =
+                providerFault && !attemptError.toolCallsOccurred;
+              if (!canRetry) break;
             }
           }
 

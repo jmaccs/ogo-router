@@ -117,10 +117,13 @@ responsible for choosing a role, integrating results, and accepting edits.
 Role profiles and their output contracts live in [`agents/`](./agents/). Their
 `tier` and `fallback_tiers` are clamped to the current budget cap and available
 authenticated models in `router.json`. Retries move through at most three
-candidate models and temporarily cool down failed models. Role tool lists are
-intersected with tools active for the current session; recursive `delegate` and
-OGO budget tools are excluded. Skills are loaded only from each role's
-`skills:` allowlist.
+candidate models, favoring provider diversity. Only rate-limit, server, and
+network failures cool down a model/provider or permit a retry; provider circuits
+use jitter and a single half-open probe. Timeouts and task/tool errors do not
+trip provider breakers, and no role is retried after issuing a tool call. Role
+tool lists are intersected with tools active for the current session;
+recursive `delegate` and OGO budget tools are excluded. Skills are loaded only
+from each role's `skills:` allowlist.
 
 Parallel mode accepts up to four independent tasks and is restricted to roles
 marked `parallel: true` (currently scout). Results above 32 KiB are saved under
