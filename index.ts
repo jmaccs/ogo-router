@@ -1,4 +1,5 @@
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, stat, writeFile } from "node:fs/promises";
+import { StringDecoder } from "node:string_decoder";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
@@ -18,6 +19,7 @@ import {
 } from "./ui.ts";
 import {
   computeSnapshotMeter,
+  computeLocalMeter as computeWeightedLocalMeter,
   parseGoUsageSnapshot,
   usageWindows,
   type GoUsageSnapshot,
@@ -53,6 +55,8 @@ type RouterState = {
   candidates: string[];
   budgetState: Pressure;
   retryCounts: Record<string, number>;
+  failedModels?: string[];
+  modelCooldowns?: Record<string, number>;
 };
 type LedgerEntry = UsageLedgerRecord & { cost: number; role?: string };
 type Quota = Record<QuotaWindow, number | null>;
@@ -93,6 +97,15 @@ let usageStateLoaded = false;
 let usageRefresh: Promise<void> | undefined;
 let modelCatalogResult: ModelCatalogResult = { changedPrices: [] };
 let modelCatalogRefresh: Promise<void> | undefined;
+type LedgerIndex = {
+  dev: number;
+  ino: number;
+  offset: number;
+  lineNumber: number;
+  partialLine: string;
+  entries: LedgerEntry[];
+};
+let ledgerIndex: LedgerIndex | undefined;
 
 function parseJson<T>(text: string, source: string): T {
   try {
@@ -282,13 +295,29 @@ function classifyCategory(text: string, thinkingLevel: string): string {
     return "deep";
   if (/\b(visual|ui|ux|frontend|css|design system)\b/.test(lower))
     return "visual-engineering";
-  if (/\b(write|writing|rewrite|edit this|proofread|copyedit)\b/.test(lower))
+  if (
+    /\b(writing|proofread|copyedit|copy edit|draft|email|article|blog post|essay|poem|press release|marketing copy)\b/.test(
+      lower,
+    ) ||
+    /\b(rewrite|edit)\s+(this|the|my)?\s*(paragraph|email|article|essay|poem|copy|document)\b/.test(
+      lower,
+    )
+  )
     return "writing";
   if (/\b(creative|illustration|artistry|brainstorm names)\b/.test(lower))
     return "artistry";
   if (/\b(quick|brief|simple|small question|one-liner)\b/.test(lower))
     return "quick";
   return thinkingLevel === "high" ? "unspecified-high" : "unspecified-low";
+}
+
+function categoryStrength(category: string): number {
+  if (category === "ultrabrain") return 4;
+  if (category === "architect" || category === "deep" || category === "unspecified-high")
+    return 3;
+  if (category === "visual-engineering" || category === "artistry") return 2;
+  if (category === "writing") return 1;
+  return 0;
 }
 
 function parseLedgerEntry(value: unknown, line: number): LedgerEntry {
@@ -328,9 +357,9 @@ function parseLedgerEntry(value: unknown, line: number): LedgerEntry {
 }
 
 async function readLedger(): Promise<LedgerEntry[]> {
-  let contents: string;
+  let fileInfo: Awaited<ReturnType<typeof stat>>;
   try {
-    contents = await readFile(ledgerPath, "utf8");
+    fileInfo = await stat(ledgerPath);
   } catch (error) {
     if (
       typeof error === "object" &&
@@ -338,19 +367,69 @@ async function readLedger(): Promise<LedgerEntry[]> {
       "code" in error &&
       error.code === "ENOENT"
     ) {
+      ledgerIndex = undefined;
       return [];
     }
     throw error;
   }
-  return contents.split("\n").flatMap((line, index) => {
-    if (!line.trim()) return [];
-    return [
-      parseLedgerEntry(
-        parseJson<unknown>(line, `${ledgerPath}:${index + 1}`),
-        index + 1,
-      ),
-    ];
-  });
+  if (
+    !ledgerIndex ||
+    ledgerIndex.dev !== fileInfo.dev ||
+    ledgerIndex.ino !== fileInfo.ino ||
+    fileInfo.size < ledgerIndex.offset
+  ) {
+    ledgerIndex = {
+      dev: fileInfo.dev,
+      ino: fileInfo.ino,
+      offset: 0,
+      lineNumber: 0,
+      partialLine: "",
+      entries: [],
+    };
+  }
+  if (fileInfo.size === ledgerIndex.offset) return [...ledgerIndex.entries];
+
+  const file = await open(ledgerPath, "r");
+  const decoder = new StringDecoder("utf8");
+  try {
+    while (ledgerIndex.offset < fileInfo.size) {
+      const buffer = Buffer.alloc(
+        Math.min(64 * 1024, fileInfo.size - ledgerIndex.offset),
+      );
+      const { bytesRead } = await file.read(
+        buffer,
+        0,
+        buffer.length,
+        ledgerIndex.offset,
+      );
+      if (!bytesRead) break;
+      ledgerIndex.offset += bytesRead;
+      const text =
+        ledgerIndex.partialLine + decoder.write(buffer.subarray(0, bytesRead));
+      const lines = text.split("\n");
+      ledgerIndex.partialLine = lines.pop() ?? "";
+      for (const line of lines) {
+        ledgerIndex.lineNumber++;
+        if (!line.trim()) continue;
+        try {
+          ledgerIndex.entries.push(
+            parseLedgerEntry(
+              JSON.parse(line) as unknown,
+              ledgerIndex.lineNumber,
+            ),
+          );
+        } catch (error) {
+          console.warn(
+            `[ogo-router] Skipping invalid usage ledger line ${ledgerIndex.lineNumber} (${ledgerPath}): ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+    }
+    ledgerIndex.partialLine += decoder.end();
+  } finally {
+    await file.close();
+  }
+  return [...ledgerIndex.entries];
 }
 
 async function loadUsageState(): Promise<void> {
@@ -469,7 +548,7 @@ async function refreshUsage(force = false): Promise<void> {
 function windowStart(window: QuotaWindow, now: number): number {
   const date = new Date(now);
   if (window === "fiveHours")
-    return Math.floor(now / usageWindows.fiveHours) * usageWindows.fiveHours;
+    return now - usageWindows.fiveHours;
   if (window === "week") {
     const day = (date.getUTCDay() + 6) % 7;
     return Date.UTC(
@@ -485,43 +564,13 @@ function computeLocalMeter(
   entries: readonly LedgerEntry[],
   now = Date.now(),
 ): Meter {
-  const used = { fiveHours: 0, week: 0, month: 0 };
-  const limit = { fiveHours: 0, week: 0, month: 0 };
-  const windowsList = Object.keys(usageWindows) as QuotaWindow[];
-  for (const [key, quota] of Object.entries(routerConfig.modelQuotas)) {
-    const { provider, id } = parseModelKey(key);
-    const modelEntries = entries.filter(
-      (entry) => entry.provider === provider && entry.model === id,
-    );
-    for (const window of windowsList) {
-      const quotaLimit = quota[window];
-      if (quotaLimit === null) continue;
-      limit[window] += quotaLimit;
-      const start = windowStart(window, now);
-      used[window] += modelEntries.filter(
-        (entry) => entry.timestamp >= start && entry.timestamp <= now,
-      ).length;
-    }
-  }
-  const utilization = windowsList.map((window) =>
-    limit[window] ? used[window] / limit[window] : 0,
+  const meter = computeWeightedLocalMeter(
+    entries,
+    routerConfig.modelQuotas,
+    now,
   );
-  const elapsed = windowsList.map((window) => {
-    const start = windowStart(window, now);
-    return Math.max((now - start) / usageWindows[window], 0.01);
-  });
-  const paceValues = windowsList.map(
-    (_, index) => utilization[index]! / Math.max(elapsed[index]!, 0.01),
-  );
-  const pace = Object.fromEntries(
-    windowsList.map((window, index) => [window, paceValues[index]!]),
-  ) as Record<QuotaWindow, number>;
   return {
-    used,
-    limit,
-    pace,
-    pressure: Math.max(...paceValues),
-    pending: { fiveHours: 0, week: 0, month: 0 },
+    ...meter,
     source: "estimate",
   };
 }
@@ -590,18 +639,11 @@ function tierCap(pressure: Pressure, thinkingLevel: string): Tier {
   }
 }
 
-function buildCandidates(category: string, thinkingLevel: string): string[] {
+function buildCandidates(category: string): string[] {
   const config = categories[category] ?? categories["unspecified-low"];
   if (!config)
     throw new Error('ogo.json must define the "unspecified-low" category');
-  const candidates = [config.model, ...config.fallback_models];
-  if (
-    thinkingLevel === "high" &&
-    ["architect", "deep", "ultrabrain", "unspecified-high"].includes(category)
-  ) {
-    candidates.push(...routerConfig.escalationModels);
-  }
-  return [...new Set(candidates)];
+  return [...new Set([config.model, ...config.fallback_models])];
 }
 
 function candidateTier(key: string): Tier {
@@ -611,11 +653,56 @@ function candidateTier(key: string): Tier {
   return tier;
 }
 
-function fallbackCandidates(maxTier: Tier): string[] {
+function fallbackCandidates(maxTier: Tier, preferredTier: Tier): string[] {
+  const driverTier = Math.min(maxTier, 2) as Tier;
+  const startTier = Math.min(driverTier, preferredTier) as Tier;
   return Object.entries(routerConfig.tierModels)
-    .filter(([tier]) => Number(tier) <= maxTier)
+    .filter(([tier]) => Number(tier) <= startTier && Number(tier) <= 2)
     .sort(([left], [right]) => Number(right) - Number(left))
     .flatMap(([, models]) => models);
+}
+
+function fallbackTierRank(tier: Tier, preferredTier: Tier): number {
+  if (tier < preferredTier) return preferredTier - tier;
+  return 10 + tier - preferredTier;
+}
+
+function failureKind(message: string): "transient" | "limited" | "other" {
+  if (
+    /\b429\b|rate.?limit|quota exceeded|too many requests|resource exhausted/i.test(
+      message,
+    )
+  )
+    return "limited";
+  if (
+    /\bHTTP\s*5\d{2}\b|\bstatus code 5\d{2}\b|\b5\d{2}\s+(server|internal server)\b|timeout|temporar(?:y|ily)|overload|network|connection/i.test(
+      message,
+    )
+  )
+    return "transient";
+  return "other";
+}
+
+function quotaAllows(
+  key: string,
+  recentRequests: ReadonlyMap<string, number>,
+): boolean {
+  const quota = routerConfig.modelQuotas[key];
+  if (!quota) return true;
+  const limit = quota.fiveHours;
+  if (limit === null || limit === undefined) return true;
+  const used = recentRequests.get(key) ?? 0;
+  return used < limit * 0.9;
+}
+
+function availableModel<T extends ModelRef>(
+  key: string,
+  available: readonly T[],
+): T | undefined {
+  const ref = parseModelKey(key);
+  return available.find(
+    (model) => model.provider === ref.provider && model.id === ref.id,
+  );
 }
 
 function renderBudgetStatus(meter: Meter): string[] {
@@ -760,31 +847,55 @@ export default function (pi: ExtensionAPI) {
       await loadUsageState();
       const available = ctx.modelRegistry.getAvailable();
       const ledger = await readLedger();
+      const recentRequests = new Map<string, number>();
+      const fiveHoursAgo = windowStart("fiveHours", Date.now());
+      for (const entry of ledger) {
+        if (entry.timestamp < fiveHoursAgo) continue;
+        const key = `${entry.provider}/${entry.model}`;
+        recentRequests.set(key, (recentRequests.get(key) ?? 0) + 1);
+      }
       const meter = computeMeter(ledger);
       const pressure = pressureState(meter, request.state?.budgetState);
       activePressure = pressure;
       const maxTier = tierCap(pressure, request.thinkingLevel);
+      const driverTier = Math.min(maxTier, 2) as Tier;
       const previousState = request.state;
-
-      if (request.reason === "continuation" && request.previous) {
-        currentRoutedModel = modelKey(request.previous.model);
-        return {
-          model: request.previous.model,
-          thinkingLevel:
-            request.previous.thinkingLevel ?? request.thinkingLevel,
-          state: previousState,
-        };
-      }
-
       let category = previousState?.category ?? "unspecified-low";
       let candidates = previousState?.candidates ?? [];
       const retryCounts = { ...(previousState?.retryCounts ?? {}) };
-      if (request.reason === "user" || !candidates.length) {
+      const failedModels = new Set(previousState?.failedModels ?? []);
+      const now = Date.now();
+      const modelCooldowns: Record<string, number> = Object.fromEntries(
+        Object.entries(previousState?.modelCooldowns ?? {}).filter(
+          ([, until]) => until > now,
+        ),
+      );
+      let preferredTier: Tier = driverTier;
+
+      if (request.reason === "user") {
+        const classified = classifyCategory(
+          getUserText(request.messages),
+          request.thinkingLevel,
+        );
+        const ambiguousHighDefault =
+          previousState?.category &&
+          previousState.category !== "unspecified-high" &&
+          classified === "unspecified-high";
+        if (
+          !previousState?.category ||
+          (!ambiguousHighDefault &&
+            categoryStrength(classified) > categoryStrength(category))
+        )
+          category = classified;
+        candidates = buildCandidates(category);
+        failedModels.clear();
+        for (const key of Object.keys(retryCounts)) delete retryCounts[key];
+      } else if (!candidates.length) {
         category = classifyCategory(
           getUserText(request.messages),
           request.thinkingLevel,
         );
-        candidates = buildCandidates(category, request.thinkingLevel);
+        candidates = buildCandidates(category);
       }
 
       if (request.reason === "direct") {
@@ -792,64 +903,137 @@ export default function (pi: ExtensionAPI) {
         candidates = Object.entries(routerConfig.tierModels)
           .filter(([tier]) => Number(tier) === 0)
           .flatMap(([, models]) => models);
+        preferredTier = 0;
+      }
+
+      const previousKey =
+        request.reason === "continuation" && request.previous
+          ? modelKey(request.previous.model)
+          : undefined;
+      if (previousKey) {
+        const previousTier = candidateTier(previousKey);
+        if (
+          previousTier <= driverTier &&
+          !failedModels.has(previousKey) &&
+          !((modelCooldowns[previousKey] ?? 0) > now) &&
+          quotaAllows(previousKey, recentRequests) &&
+          availableModel(previousKey, available)
+        ) {
+          currentRoutedModel = previousKey;
+          return {
+            model: request.previous!.model,
+            thinkingLevel:
+              request.previous!.thinkingLevel ?? request.thinkingLevel,
+            state: {
+              category,
+              candidates,
+              budgetState: pressure,
+              retryCounts,
+              failedModels: [...failedModels],
+              modelCooldowns,
+            },
+          };
+        }
+        candidates = [...new Set([previousKey, ...candidates])];
+        preferredTier = Math.min(
+          driverTier,
+          Math.max(0, previousTier - 1),
+        ) as Tier;
+      } else if (candidates.length) {
+        preferredTier = Math.min(
+          driverTier,
+          candidateTier(candidates[0]!),
+        ) as Tier;
       }
 
       if (request.reason === "retry" && request.failed) {
         const failedKey = modelKey(request.failed.model);
-        const failedMessage = request.failed.message;
-        const transient =
-          /timeout|temporar|overload|5\d\d|network|connection/i.test(
-            failedMessage.errorMessage ?? "",
-          );
+        const failure = failureKind(
+          request.failed.message.errorMessage ?? "",
+        );
         const attempts = retryCounts[failedKey] ?? 0;
-        if (transient && attempts === 0) {
+        if (
+          failure === "transient" &&
+          attempts === 0 &&
+          candidateTier(failedKey) <= driverTier
+        ) {
           retryCounts[failedKey] = 1;
           currentRoutedModel = failedKey;
           return {
             model: request.failed.model,
             thinkingLevel:
               request.failed.thinkingLevel ?? request.thinkingLevel,
-            state: { category, candidates, budgetState: pressure, retryCounts },
+            state: {
+              category,
+              candidates,
+              budgetState: pressure,
+              retryCounts,
+              failedModels: [...failedModels],
+              modelCooldowns,
+            },
           };
         }
+        failedModels.add(failedKey);
+        if (failure === "limited")
+          modelCooldowns[failedKey] = now + 5 * 60 * 1000;
+        else if (failure === "transient")
+          modelCooldowns[failedKey] = now + 60 * 1000;
         const failedIndex = candidates.indexOf(failedKey);
         if (failedIndex >= 0) candidates = candidates.slice(failedIndex + 1);
         candidates = candidates.filter((key) => key !== failedKey);
       }
 
-      const candidatePool = [
-        ...new Set([...candidates, ...fallbackCandidates(maxTier)]),
-      ];
-      const eligible = candidatePool.filter((key) => {
-        const tier = candidateTier(key);
-        if (tier > maxTier) return false;
-        const quota = routerConfig.modelQuotas[key];
-        if (!quota) return true;
-        const used = ledger.filter(
-          (entry) =>
-            `${entry.provider}/${entry.model}` === key &&
-            entry.timestamp >= windowStart("fiveHours", Date.now()),
-        ).length;
-        const limit = quota.fiveHours;
-        return limit === null || limit === undefined || used < limit * 0.9;
-      });
-      const selectedKey = eligible.find((key) => {
-        const ref = parseModelKey(key);
-        return available.some(
-          (model) => model.provider === ref.provider && model.id === ref.id,
+      let primary: string | undefined;
+      if (request.reason === "user" || request.reason === "direct") {
+        primary = candidates[0];
+      } else if (request.reason === "continuation") {
+        primary = candidates.find(
+          (key) => key !== previousKey && candidateTier(key) === preferredTier,
+        );
+      }
+      const fallbacks = [
+        ...new Set([
+          ...candidates.filter((key) => key !== primary),
+          ...fallbackCandidates(driverTier, preferredTier),
+        ]),
+      ].filter((key) => key !== primary);
+      const fallbackOrder = new Map(
+        fallbacks.map((key, index) => [key, index]),
+      );
+      fallbacks.sort((left, right) => {
+        const tierDifference =
+          fallbackTierRank(candidateTier(left), preferredTier) -
+          fallbackTierRank(candidateTier(right), preferredTier);
+        if (tierDifference !== 0) return tierDifference;
+        return (
+          (fallbackOrder.get(left) ?? 0) -
+          (fallbackOrder.get(right) ?? 0)
         );
       });
+      const candidatePool = [
+        ...new Set([
+          ...(primary ? [primary] : []),
+          ...fallbacks,
+        ]),
+      ];
+      const eligible = candidatePool.filter((key) => {
+        return (
+          candidateTier(key) <= driverTier &&
+          !failedModels.has(key) &&
+          !((modelCooldowns[key] ?? 0) > now) &&
+          quotaAllows(key, recentRequests)
+        );
+      });
+      const selectedKey = eligible.find((key) =>
+        availableModel(key, available),
+      );
       if (!selectedKey) {
         throw new Error(
-          `No available model for category "${category}" under the ${pressure} budget cap (tier ${maxTier}). ` +
+          `No available model for category "${category}" under the ${pressure} budget cap (tier ${driverTier}). ` +
             "Check provider credentials, router.json tier mappings, and local quotas.",
         );
       }
-      const selectedRef = parseModelKey(selectedKey);
-      const model = available.find(
-        (item) =>
-          item.provider === selectedRef.provider && item.id === selectedRef.id,
-      );
+      const model = availableModel(selectedKey, available);
       if (!model)
         throw new Error(`Selected model ${selectedKey} is no longer available`);
       currentRoutedModel = selectedKey;
@@ -857,7 +1041,14 @@ export default function (pi: ExtensionAPI) {
       return {
         model,
         thinkingLevel: request.thinkingLevel,
-        state: { category, candidates, budgetState: pressure, retryCounts },
+        state: {
+          category,
+          candidates,
+          budgetState: pressure,
+          retryCounts,
+          failedModels: [...failedModels],
+          modelCooldowns,
+        },
       };
     },
   });

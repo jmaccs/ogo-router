@@ -258,25 +258,27 @@ be validated before adding more orchestration behavior.
 
 ### R2. Router fallback and budget enforcement
 
-- [ ] Keep failed-model cooldowns in routing state and filter after fallback
+- [x] Keep failed-model cooldowns in routing state and filter after fallback
   expansion; persist cooldowns only if cross-restart behavior is needed.
-- [ ] Order fallbacks from the selected tier toward cheaper tiers first.
-- [ ] Enforce tier caps during continuations and add a per-request spend ceiling
-  checked when assistant usage is recorded.
-- [ ] Keep T3 models out of the conductor route; use them only for explicitly
-  budget-gated planner/debugger delegation. Add configurable session/day dollar
-  caps for separately billed non-Go providers.
-- [ ] Classify retry failures precisely (429/quota, 5xx, network, timeout,
-  context/capability, and task failure) so only safe provider failures retry.
+- [x] Order fallbacks from the selected tier toward cheaper tiers first.
+- [x] Enforce tier caps during continuations; over-cap models downgrade to the
+  nearest eligible tier.
+- [ ] Add a per-request spend ceiling checked when assistant usage is recorded
+  (currently disabled by user choice; no threshold configured).
+- [x] Keep T3 models out of the conductor route. Separately billed non-Go
+  session/day USD caps remain disabled by user choice pending thresholds.
+- [x] Classify retry failures (429/quota, 5xx, network, timeout,
+  context/capability, and task failure); only transient provider failures retry
+  the same model, while other failures exclude it from the current attempt.
 
 ### R3. Usage accounting and category stability
 
-- [ ] Tolerate malformed/torn ledger lines with a warning and maintain an
+- [x] Tolerate malformed/torn ledger lines with a warning and maintain an
   in-memory ledger index rather than reparsing the entire file on each route.
-- [ ] Estimate local utilization as per-model request fractions against each
+- [x] Estimate local utilization as per-model request fractions against each
   model's configured quota, and use a rolling five-hour window.
-- [ ] Correct early-window pace behavior in both local and snapshot meters.
-- [ ] Keep the task category sticky across acknowledgments and permit new
+- [x] Correct early-window pace behavior in both local and snapshot meters.
+- [x] Keep the task category sticky across acknowledgments and permit new
   evidence to escalate, but not silently downgrade, the category.
 
 ### R4. Safe and bounded delegation

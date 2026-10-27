@@ -10,21 +10,21 @@ select `ogo/auto`.
 ## Routing
 
 - `low` allows tiers 0-1, `medium` allows tiers 0-2, and `high` allows tiers
-  0-3 while the budget state permits them.
+  0-2 while the budget state permits them. Tier 3 is not a conductor model.
 - Request text is classified with lightweight keyword rules. Edit
   `classifyCategory()` in `index.ts` if your prompts use different vocabulary.
 - Category primaries and fallbacks are in `ogo.json`; tier assignments,
-  quota estimates, and optional OpenRouter escalation are in `router.json`.
+  quota estimates, and OpenRouter consultant models are in `router.json`.
 - Delegation considers only models explicitly listed for a role's configured
   tiers. Within each tier it prefers available tool-capable OpenCode Go models
-  with lower catalog input-plus-output prices; tier order and budget caps are
-  unchanged.
-- `direct` requests (such as compaction) use tier 0. Tool continuations stay
-  sticky. A transient retry repeats the same model once; later retries move
-  through the category fallback list.
-- Tier 3 is OpenRouter's built-in provider and is only considered for a
-  `high`-thinking architecture, deep-analysis, or ultrabrain request. It is
-  billed separately and excluded from the Go quota estimate.
+  with lower catalog input-plus-output prices.
+- `direct` requests (such as compaction) use tier 0. Continuations stay on the
+  current model while it remains under the live tier and quota caps; otherwise
+  they downgrade. A classified transient provider error retries the model once,
+  then applies a session-state cooldown and advances through eligible fallbacks.
+- Tier 3 is not selected by the conductor. It remains available only to
+  delegation roles configured for it, is billed separately, and is excluded
+  from the Go quota estimate. Non-Go USD caps are currently disabled.
 
 ## Go usage and local reconciliation
 
@@ -47,10 +47,15 @@ Requests observed by Pi since the last snapshot are shown as a separate
 optimistic request-count delta; they are not added to the API percentages
 because the API reports percentages, not a per-request conversion. If the
 endpoint is unavailable or `OPENCODE_API_KEY` is missing, the meter falls back
-to a clearly labeled local request-count estimate based on `router.json`.
+to a clearly labeled local quota-weighted request-fraction estimate based on
+per-model quotas in `router.json`. The local five-hour window rolls from the
+current time; early-window pace estimates use conservative elapsed-time floors.
 Local estimates cannot observe usage from other clients and are not an
 account-wide balance. A previously successful snapshot is retained and labeled
 stale when refresh fails.
+
+Malformed or torn ledger lines are skipped with a warning. Valid entries are
+indexed incrementally in memory, including appends made by other Pi processes.
 
 The meter uses `resetsAt` with 5-hour rolling and 7-day weekly windows; the
 monthly pace estimate uses the calendar month preceding `resetsAt`. Usage

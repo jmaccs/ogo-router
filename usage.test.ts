@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { computeSnapshotMeter, parseGoUsageSnapshot, usageWindows } from "./usage.ts";
+import {
+	computeLocalMeter,
+	computeSnapshotMeter,
+	parseGoUsageSnapshot,
+	usageWindows,
+} from "./usage.ts";
 
 const now = Date.UTC(2026, 9, 23, 12);
 
@@ -57,5 +62,71 @@ describe("Go usage snapshots", () => {
 				now,
 			),
 		).toThrow("invalid rolling reset time");
+	});
+
+	test("weights local requests by their own model quota and uses rolling five hours", () => {
+		const now = Date.UTC(2026, 9, 23, 12, 2);
+		const quotas = {
+			"opencode-go/high-quota": {
+				fiveHours: 100,
+				week: 100,
+				month: 100,
+			},
+			"opencode-go/low-quota": {
+				fiveHours: 10,
+				week: 10,
+				month: 10,
+			},
+		};
+		const entries = [
+			{
+				provider: "opencode-go",
+				model: "high-quota",
+				cost: 0,
+				timestamp: now,
+			},
+			...Array.from({ length: 10 }, () => ({
+				provider: "opencode-go",
+				model: "low-quota",
+				cost: 0,
+				timestamp: now,
+			})),
+			{
+				provider: "opencode-go",
+				model: "low-quota",
+				cost: 0,
+				timestamp: now - usageWindows.fiveHours - 1,
+			},
+		];
+
+		const meter = computeLocalMeter(entries, quotas, now);
+
+		expect(meter.used.fiveHours).toBeCloseTo(101);
+		expect(meter.limit.fiveHours).toBe(100);
+	});
+
+	test("does not turn a small early-window burst into red pace", () => {
+		const now = Date.UTC(2026, 9, 23, 12, 2);
+		const meter = computeLocalMeter(
+			[
+				{
+					provider: "opencode-go",
+					model: "m1",
+					cost: 0,
+					timestamp: now,
+				},
+			],
+			{
+				"opencode-go/m1": {
+					fiveHours: 100,
+					week: 100,
+					month: 100,
+				},
+			},
+			now,
+		);
+
+		expect(meter.pace.fiveHours).toBeLessThan(0.8);
+		expect(meter.pressure).toBeLessThan(0.8);
 	});
 });

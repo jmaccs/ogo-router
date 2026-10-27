@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -14,7 +14,14 @@ describe("OGO router M1", () => {
 	let originalDataDir: string | undefined;
 	let originalApiKey: string | undefined;
 	let originalFetch: typeof globalThis.fetch;
-	let virtualModel: ExtensionVirtualModel<unknown> | undefined;
+	let virtualModel: ExtensionVirtualModel<{
+		category: string;
+		candidates: string[];
+		budgetState: "green" | "yellow" | "orange" | "red";
+		retryCounts: Record<string, number>;
+		failedModels?: string[];
+		modelCooldowns?: Record<string, number>;
+	}> | undefined;
 	let readDashboardSnapshot:
 		| (() => { budget?: { source: string; status: string[]; notes: string[] } })
 		| undefined;
@@ -108,7 +115,7 @@ describe("OGO router M1", () => {
 		const extension = (await import("./index.ts")).default;
 		readDashboardSnapshot = (await import("./ui.ts")).getDashboardSnapshot;
 		const api = {
-			registerVirtualModel(definition: ExtensionVirtualModel<unknown>) {
+			registerVirtualModel(definition: NonNullable<typeof virtualModel>) {
 				virtualModel = definition;
 			},
 			registerTool() {},
@@ -171,18 +178,96 @@ describe("OGO router M1", () => {
 			failed: { model: user.model, message: { errorMessage: "quota exceeded" } },
 		} as never, routeContext);
 		expect(retry.model.id).toBe("longcat-2.0");
+		const transientRetry = await route({
+			...request,
+			reason: "retry",
+			state: user.state,
+			failed: { model: user.model, message: { errorMessage: "HTTP 503" } },
+		} as never, routeContext);
+		expect(transientRetry.model.id).toBe(user.model.id);
+		const afterTransientRetry = await route({
+			...request,
+			reason: "retry",
+			state: transientRetry.state,
+			failed: { model: user.model, message: { errorMessage: "HTTP 503" } },
+		} as never, routeContext);
+		expect(afterTransientRetry.model.id).not.toBe(user.model.id);
+		expect(afterTransientRetry.state?.modelCooldowns?.["opencode-go/mimo-v2.5"]).toBeGreaterThan(Date.now());
+		const tokenLimitError = await route({
+			...request,
+			reason: "retry",
+			state: user.state,
+			failed: {
+				model: user.model,
+				message: { errorMessage: "maximum context is 512 tokens" },
+			},
+		} as never, routeContext);
+		expect(tokenLimitError.model.id).not.toBe(user.model.id);
+		expect(tokenLimitError.state?.modelCooldowns?.["opencode-go/mimo-v2.5"]).toBeUndefined();
+		const afterCooldown = await route({
+			...request,
+			reason: "user",
+			state: afterTransientRetry.state,
+		} as never, routeContext);
+		expect(afterCooldown.model.id).not.toBe(user.model.id);
+
+		const parserRequest = await route({
+			...request,
+			reason: "user",
+			state: direct.state,
+			messages: [{ role: "user", content: "write a parser for this format", timestamp: Date.now() }],
+		} as never, routeContext);
+		expect(parserRequest.state?.category).toBe("unspecified-low");
+		const emailRequest = await route({
+			...request,
+			reason: "user",
+			state: direct.state,
+			messages: [{ role: "user", content: "write a short email to the team", timestamp: Date.now() }],
+		} as never, routeContext);
+		expect(emailRequest.state?.category).toBe("writing");
+		const hardTask = await route({
+			...request,
+			thinkingLevel: "high",
+			reason: "user",
+			messages: [{ role: "user", content: "debug the root cause of this failure", timestamp: Date.now() }],
+		} as never, routeContext);
+		const cheaperFallback = await route({
+			...request,
+			thinkingLevel: "high",
+			reason: "retry",
+			state: hardTask.state,
+			failed: {
+				model: hardTask.model,
+				message: { errorMessage: "quota exceeded" },
+			},
+		} as never, routeContext);
+		expect(tierByModel.get(`${cheaperFallback.model.provider}/${cheaperFallback.model.id}`)).toBe(0);
+		const acknowledgment = await route({
+			...request,
+			thinkingLevel: "high",
+			reason: "user",
+			state: hardTask.state,
+			messages: [{ role: "user", content: "ok, go ahead", timestamp: Date.now() }],
+		} as never, routeContext);
+		expect(acknowledgment.state?.category).toBe("deep");
 		process.env.OPENCODE_API_KEY = "mock-test-key";
 		await invoke("session_start", { type: "session_start" });
 		const allModels = models;
 		models = [{ provider: "openrouter", id: "anthropic/claude-opus-4.8" }];
-		const escalation = await route({
+		await expect(route({
+			...request,
+			thinkingLevel: "high",
+			messages: [{ role: "user", content: "ultrabrain formal verification", timestamp: Date.now() }],
+			reason: "user",
+		} as never, routeContext)).rejects.toThrow("No available model");
+		models = allModels;
+		const highBudgetRoute = await route({
 			...request,
 			thinkingLevel: "high",
 			messages: [{ role: "user", content: "ultrabrain formal verification", timestamp: Date.now() }],
 			reason: "user",
 		} as never, routeContext);
-		expect(escalation.model.provider).toBe("openrouter");
-		models = allModels;
+		expect(tierByModel.get(`${highBudgetRoute.model.provider}/${highBudgetRoute.model.id}`)).toBeLessThanOrEqual(2);
 
 		process.env.OPENCODE_API_KEY = "mock-test-key";
 		await invoke("session_start", { type: "session_start" });
@@ -223,6 +308,14 @@ describe("OGO router M1", () => {
 		expect(budget.source).toContain("Go usage live");
 		expect(status.size).toBe(0);
 		expect(notifications).toBe(0);
+		const cappedContinuation = await route({
+			...request,
+			thinkingLevel: "high",
+			reason: "continuation",
+			previous: { model: highBudgetRoute.model, thinkingLevel: "high" },
+			state: highBudgetRoute.state,
+		} as never, routeContext);
+		expect(tierByModel.get(`${cappedContinuation.model.provider}/${cappedContinuation.model.id}`)).toBeLessThanOrEqual(1);
 		const redBudgetRoute = await route({
 			...request,
 			thinkingLevel: "high",
@@ -232,5 +325,16 @@ describe("OGO router M1", () => {
 		expect(tierByModel.get(`${redBudgetRoute.model.provider}/${redBudgetRoute.model.id}`)).toBeLessThanOrEqual(1);
 		const ledger = await readFile(join(tempHome, ".pi", "agent", "ogo-router-usage.jsonl"), "utf8");
 		expect(JSON.parse(ledger.trim()).recordedAt).toBeNumber();
+		await appendFile(
+			join(tempHome, ".pi", "agent", "ogo-router-usage.jsonl"),
+			"{torn ledger line\n",
+			"utf8",
+		);
+		const routeWithTornLedger = await route({
+			...request,
+			reason: "user",
+			messages: [{ role: "user", content: "quick summary", timestamp: Date.now() }],
+		} as never, routeContext);
+		expect(routeWithTornLedger.model.id).toBeTruthy();
 	});
 });
