@@ -2,7 +2,7 @@
 
 Extension that keeps the main loop on a mid-tier model, escalates to strong models only when needed, and steers by Go usage budgets.
 
-**Progress:** M0 groundwork and M1 routing/budget-meter work are implemented, with live authenticated usage validation still open. M2 isolated delegation is implemented, including role profiles, skill allowlists, usage accounting, task logs, and optional tmux panes. M3 escalation triggers, M4 review/memory hooks, and M5 operational tuning remain incomplete. In the current Pi installation, `opencode-go` models are present in the configured model store and OpenRouter is a built-in provider. The Go usage response schema was supplied as a redacted sample; no authenticated live account request was made.
+**Progress:** M0 groundwork and M1 routing/budget-meter work are implemented, with live authenticated usage validation still open. M2 isolated delegation is implemented, including role profiles, skill allowlists, usage accounting, task logs, and optional tmux panes. The completed R1 lifecycle fixes and implemented R2/R3 routing and accounting work are tracked separately from the remaining delegate-isolation, spend-ceiling, and estimation items. Return to the main feature roadmap with M3 escalation and fallback, followed by M4 review/memory hooks and M5 operational tuning. In the current Pi installation, `opencode-go` models are present in the configured model store and OpenRouter is a built-in provider. The Go usage response schema was supplied as a redacted sample; no authenticated live account request was made.
 
 ## M0. Verify the ground
 
@@ -235,6 +235,11 @@ Escalation: request_escalation, the stuck detector, planner and debugger roles, 
 Review gate and the compaction and memory hooks.
 Verify and integrate the Go usage endpoint, then harden snapshot/delta reconciliation and the labeled local fallback.
 
+**Next feature milestone:** Resume M3 at `request_escalation` and the stuck
+detector; the prompt-argv reliability item is complete. Continue to track the
+remaining R4 delegate-isolation work independently rather than expanding this
+small lifecycle fix into that larger design decision.
+
 ## Reliability fixes backlog
 
 The following work was identified in the routing and delegation review. Keep
@@ -253,7 +258,7 @@ be validated before adding more orchestration behavior.
   as delegate tool errors.
 - [x] Catch per-task setup errors and settle parallel tasks so one rejection
   cannot orphan sibling scouts.
-- [ ] Move large system/user prompts out of process arguments to avoid
+- [x] Move large system/user prompts out of process arguments to avoid
   per-argument size limits and exposing task content in process listings.
 
 ### R2. Router fallback and budget enforcement

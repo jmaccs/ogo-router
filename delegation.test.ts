@@ -142,7 +142,7 @@ describe("OGO delegation", () => {
 		].map((event) => JSON.stringify(event)).join("\n");
 		const cliPath = join(tempDir, "fake-pi");
 		const argPath = join(tempDir, "args.json");
-		const script = `#!${process.execPath}\nawait Bun.write(${JSON.stringify(argPath)}, JSON.stringify(process.argv.slice(2)));\nprocess.stderr.write("diagnostic line\\n");\nprocess.stdout.write(${JSON.stringify(`${events}\n`)});\n`;
+		const script = `#!${process.execPath}\nconst args = process.argv.slice(2);\nconst systemPromptPath = args[args.indexOf("--append-system-prompt") + 1];\nconst userPromptArg = args.find((arg) => arg.startsWith("@"));\nawait Bun.write(${JSON.stringify(argPath)}, JSON.stringify({ args, systemPrompt: await Bun.file(systemPromptPath).text(), userPrompt: await Bun.file(userPromptArg.slice(1)).text() }));\nprocess.stderr.write("diagnostic line\\n");\nprocess.stdout.write(${JSON.stringify(`${events}\n`)});\n`;
 		await Bun.write(cliPath, script);
 		await chmod(cliPath, 0o755);
 		process.env.PI_CLI_PATH = cliPath;
@@ -196,13 +196,31 @@ describe("OGO delegation", () => {
 			context,
 		);
 		const text = result.content.find((block) => block.type === "text")?.text ?? "";
-		const args = JSON.parse(await readFile(argPath, "utf8")) as string[];
+		const captured = JSON.parse(await readFile(argPath, "utf8")) as {
+			args: string[];
+			systemPrompt: string;
+			userPrompt: string;
+		};
+		const args = captured.args;
+		const systemPromptArgIndex = args.indexOf("--append-system-prompt");
+		const systemPromptPath = args[systemPromptArgIndex + 1] ?? "";
+		const userPromptArg = args.find((arg) => arg.startsWith("@"));
 
 		expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(32 * 1024);
 		expect(text).toContain("Full result saved to:");
 		expect(args.slice(args.indexOf("--tools") + 1, args.indexOf("--tools") + 2)).toEqual(["read,grep,find,ls"]);
 		expect(args).toContain("--no-skills");
 		expect(args).toContain("--no-extensions");
+		expect(systemPromptArgIndex).toBeGreaterThan(-1);
+		expect(systemPromptPath).not.toBe("");
+		expect(userPromptArg).toContain("@");
+		expect(systemPromptPath.endsWith("system-prompt.txt")).toBe(true);
+		expect(userPromptArg!.endsWith("user-prompt.txt")).toBe(true);
+		expect(captured.systemPrompt).toContain("This role is read-only");
+		expect(captured.userPrompt).toContain("Inspect the test fixture.");
+		expect(args).not.toContain("Inspect the test fixture.");
+		expect(await Bun.file(systemPromptPath).exists()).toBe(false);
+		expect(await Bun.file(userPromptArg!.slice(1)).exists()).toBe(false);
 		expect(recorded).toHaveLength(1);
 		expect(recorded[0]?.role).toBe("scout");
 		expect(recorded[0]?.messages).toHaveLength(1);

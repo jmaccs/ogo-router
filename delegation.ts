@@ -1,7 +1,15 @@
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -302,15 +310,14 @@ function addAssistantMessages(
 }
 
 function byteTruncate(text: string, maxBytes: number): string {
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  const bytes = Buffer.from(text, "utf8");
+  if (bytes.byteLength <= maxBytes) return text;
   const marker = "\n\n[truncated]";
   const contentLimit = Math.max(
     0,
     maxBytes - Buffer.byteLength(marker, "utf8"),
   );
-  const output = Buffer.from(text, "utf8")
-    .subarray(0, contentLimit)
-    .toString("utf8");
+  const output = bytes.subarray(0, contentLimit).toString("utf8");
   return `${output}${marker}`;
 }
 
@@ -614,6 +621,18 @@ async function runModel(
   ]
     .filter(Boolean)
     .join("\n\n");
+  const tempDir = await mkdtemp(join(tmpdir(), "ogo-delegate-prompt-"));
+  const systemPromptPath = join(tempDir, "system-prompt.txt");
+  const userPromptPath = join(tempDir, "user-prompt.txt");
+  try {
+    await Promise.all([
+      writeFile(systemPromptPath, systemPrompt, "utf8"),
+      writeFile(userPromptPath, userPrompt, "utf8"),
+    ]);
+  } catch (error) {
+    await rm(tempDir, { recursive: true, force: true });
+    throw error;
+  }
   const args = [
     "--mode",
     "json",
@@ -626,7 +645,8 @@ async function runModel(
   if (tools.length) args.push("--tools", tools.join(","));
   else args.push("--no-tools");
   args.push("--exclude-tools", "delegate", "--no-skills");
-  args.push("--append-system-prompt", systemPrompt, userPrompt);
+  args.push("--append-system-prompt", systemPromptPath);
+  args.push(`@${userPromptPath}`);
 
   const result: SubtaskResult = {
     role: role.name,
@@ -728,114 +748,118 @@ async function runModel(
   };
 
   const command = process.env.PI_CLI_PATH || "pi";
-  const child = spawn(command, args, {
-    cwd,
-    shell: false,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  try {
+    const child = spawn(command, args, {
+      cwd,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
 
-  terminateChild = () => {
-    child.kill("SIGTERM");
-    if (!killTimer) {
-      killTimer = setTimeout(() => child.kill("SIGKILL"), 2_000);
-      killTimer.unref();
-    }
-  };
-  const abortChild = () => {
-    aborted = true;
-    terminateChild();
-  };
-  if (signal?.aborted) abortChild();
-  else signal?.addEventListener("abort", abortChild, { once: true });
-
-  let timeout: ReturnType<typeof setTimeout>;
-  const exitCode = await new Promise<number>((resolveExit) => {
-    timeout = setTimeout(() => {
-      processError = new Error(
-        `Delegate timed out after ${processTimeoutMs / 1000}s`,
-      );
+    terminateChild = () => {
+      child.kill("SIGTERM");
+      if (!killTimer) {
+        killTimer = setTimeout(() => child.kill("SIGKILL"), 2_000);
+        killTimer.unref();
+      }
+    };
+    const abortChild = () => {
+      aborted = true;
       terminateChild();
-    }, processTimeoutMs);
-    timeout.unref();
-    child.stdout.on("data", (chunk: Buffer) => {
-      outputBytes += chunk.length;
-      if (outputBytes > maxProcessOutputBytes) {
-        processError ??= new Error(
-          "Delegate JSON output exceeded the 8 MiB process limit",
+    };
+    if (signal?.aborted) abortChild();
+    else signal?.addEventListener("abort", abortChild, { once: true });
+
+    let timeout: ReturnType<typeof setTimeout>;
+    const exitCode = await new Promise<number>((resolveExit) => {
+      timeout = setTimeout(() => {
+        processError = new Error(
+          `Delegate timed out after ${processTimeoutMs / 1000}s`,
         );
         terminateChild();
-        return;
-      }
-      buffer += stdoutDecoder.write(chunk);
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) processMessage(line);
+      }, processTimeoutMs);
+      timeout.unref();
+      child.stdout.on("data", (chunk: Buffer) => {
+        outputBytes += chunk.length;
+        if (outputBytes > maxProcessOutputBytes) {
+          processError ??= new Error(
+            "Delegate JSON output exceeded the 8 MiB process limit",
+          );
+          terminateChild();
+          return;
+        }
+        buffer += stdoutDecoder.write(chunk);
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) processMessage(line);
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        const text = stderrDecoder.write(chunk);
+        stderr = byteTruncateTail(stderr + text, maxStderrBytes);
+        if (text.trim()) log(`[stderr] ${text.trimEnd()}`);
+      });
+      child.once("error", (error) => {
+        processError ??= error;
+        terminateChild();
+      });
+      child.once("close", (code) => {
+        clearTimeout(timeout);
+        if (killTimer) clearTimeout(killTimer);
+        buffer += stdoutDecoder.end();
+        const finalStderr = stderrDecoder.end();
+        stderr = byteTruncateTail(stderr + finalStderr, maxStderrBytes);
+        if (finalStderr.trim()) log(`[stderr] ${finalStderr.trimEnd()}`);
+        if (buffer.trim()) processMessage(buffer);
+        processError ??= protocolError;
+        resolveExit(code ?? 1);
+      });
     });
-    child.stderr.on("data", (chunk: Buffer) => {
-      const text = stderrDecoder.write(chunk);
-      stderr = byteTruncateTail(stderr + text, maxStderrBytes);
-      if (text.trim()) log(`[stderr] ${text.trimEnd()}`);
-    });
-    child.once("error", (error) => {
-      processError ??= error;
-      terminateChild();
-    });
-    child.once("close", (code) => {
-      clearTimeout(timeout);
-      if (killTimer) clearTimeout(killTimer);
-      buffer += stdoutDecoder.end();
-      const finalStderr = stderrDecoder.end();
-      stderr = byteTruncateTail(stderr + finalStderr, maxStderrBytes);
-      if (finalStderr.trim()) log(`[stderr] ${finalStderr.trimEnd()}`);
-      if (buffer.trim()) processMessage(buffer);
-      processError ??= protocolError;
-      resolveExit(code ?? 1);
-    });
-  });
-  clearTimeout(timeout!);
-  signal?.removeEventListener("abort", abortChild);
-  await onUsage(messages, role.name);
-  addAssistantMessages(result.usage, messages);
+    clearTimeout(timeout!);
+    signal?.removeEventListener("abort", abortChild);
+    await onUsage(messages, role.name);
+    addAssistantMessages(result.usage, messages);
 
-  if (processError)
-    throw new DelegateAttemptError(
-      processError.message,
-      providerFailureKind(processError.message, processError),
-      toolCallsOccurred,
-    );
-  if (aborted || signal?.aborted)
-    throw new DelegateAttemptError(
-      `Delegate "${role.name}" was cancelled`,
-      "other",
-      toolCallsOccurred,
-    );
-  const lastMessage = [...messages].reverse().find(isAssistantMessage);
-  if (
-    exitCode !== 0 ||
-    !result.output ||
-    (lastMessage && lastMessage.stopReason === "error")
-  ) {
-    const reason =
-      stderr.trim() ||
-      (lastMessage && typeof lastMessage.errorMessage === "string"
-        ? lastMessage.errorMessage
-        : `Pi exited with code ${exitCode}`);
-    const failureEvidence = [
-      stderr,
-      lastMessage &&
-      typeof lastMessage.errorMessage === "string"
-        ? lastMessage.errorMessage
-        : "",
-      `Pi exited with code ${exitCode}`,
-    ].join("\n");
-    throw new DelegateAttemptError(
-      reason,
-      providerFailureKind(failureEvidence),
-      toolCallsOccurred,
-      Boolean(lastMessage),
-    );
+    if (processError)
+      throw new DelegateAttemptError(
+        processError.message,
+        providerFailureKind(processError.message, processError),
+        toolCallsOccurred,
+      );
+    if (aborted || signal?.aborted)
+      throw new DelegateAttemptError(
+        `Delegate "${role.name}" was cancelled`,
+        "other",
+        toolCallsOccurred,
+      );
+    const lastMessage = [...messages].reverse().find(isAssistantMessage);
+    if (
+      exitCode !== 0 ||
+      !result.output ||
+      (lastMessage && lastMessage.stopReason === "error")
+    ) {
+      const reason =
+        stderr.trim() ||
+        (lastMessage && typeof lastMessage.errorMessage === "string"
+          ? lastMessage.errorMessage
+          : `Pi exited with code ${exitCode}`);
+      const failureEvidence = [
+        stderr,
+        lastMessage &&
+        typeof lastMessage.errorMessage === "string"
+          ? lastMessage.errorMessage
+          : "",
+        `Pi exited with code ${exitCode}`,
+      ].join("\n");
+      throw new DelegateAttemptError(
+        reason,
+        providerFailureKind(failureEvidence),
+        toolCallsOccurred,
+        Boolean(lastMessage),
+      );
+    }
+    return result;
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
   }
-  return result;
 }
 
 async function capAndSpill(
